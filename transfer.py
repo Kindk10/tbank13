@@ -1,4 +1,5 @@
 from mitmproxy import http
+import copy
 import json
 import random
 import re
@@ -279,11 +280,22 @@ def _hydrate_bank_logo_from_presets() -> None:
 def get_bank_logo(bank_name):
     if not bank_name:
         return BANK_LOGO.get("Т-Банк")
-    if bank_name in BANK_LOGO:
-        return BANK_LOGO[bank_name]
+    clean = str(bank_name).replace("+", " ").strip()
+    if clean in BANK_LOGO:
+        return BANK_LOGO[clean]
+    low = clean.lower()
+    low_compact = re.sub(r"[\s\-_]+", "", low)
     for key, url in BANK_LOGO.items():
-        if key.lower() in bank_name.lower() or bank_name.lower() in key.lower():
+        kl = key.lower()
+        kl_compact = re.sub(r"[\s\-_]+", "", kl)
+        if kl in low or low in kl or (kl_compact and low_compact and (kl_compact in low_compact or low_compact in kl_compact)):
             return url
+    try:
+        from_presets = history_mod._logo_from_bank_label(clean)
+        if from_presets:
+            return from_presets
+    except Exception:
+        pass
     return BANK_LOGO.get("Т-Банк")
 
 
@@ -293,7 +305,7 @@ _hydrate_bank_logo_from_presets()
 def clean_bank_name(name):
     if not name:
         return "Т-Банк"
-    name = str(name).strip()
+    name = unquote_plus(str(name)).replace("+", " ").strip()
     if "Озон" in name:
         return "Озон Банк (Ozon)"
     if any(x in name for x in ("Wildberries", "Вайлдберриз", "WB")):
@@ -405,12 +417,22 @@ _fake_payment_done = False
 
 
 def _build_fake_record(operation_id: str, op_ts_ms: int, pdf_path=None) -> dict:
+    bank_clean = clean_bank_name(transfer_data.get("bank_receiver") or "Т-Банк")
     if transfer_data.get("is_merchant_payment") and transfer_data.get("merchant_name"):
         display_name = transfer_data["merchant_name"]
         logo_url = transfer_data.get("merchant_logo") or get_bank_logo(display_name)
     else:
-        display_name = transfer_data.get("receiver_name") or transfer_data.get("bank_receiver", "Т-Банк")
-        logo_url = transfer_data.get("bank_logo") or get_bank_logo(transfer_data.get("bank_receiver", "Т-Банк"))
+        display_name = transfer_data.get("receiver_name") or bank_clean
+        logo_url = transfer_data.get("bank_logo") or get_bank_logo(bank_clean)
+    try:
+        logo_url = history_mod._normalize_logo_url(logo_url) or logo_url
+    except Exception:
+        pass
+    bank_preset_key = "sbp"
+    try:
+        bank_preset_key = history_mod._guess_bank_preset_key(bank_clean)
+    except Exception:
+        pass
     amt_raw = round(abs(float(transfer_data.get("amount", 0) or 0)), 2)
     amt_val = int(amt_raw) if abs(amt_raw - int(amt_raw)) < 1e-9 else amt_raw
     rub_cur = {"code": 643, "name": "RUB", "strCode": "643"}
@@ -450,6 +472,7 @@ def _build_fake_record(operation_id: str, op_ts_ms: int, pdf_path=None) -> dict:
         "description": display_name,
         "category": {"id": "45", "name": "Другое"},
         "brand": {"id": "11250", "name": display_name, "logo": logo_url, "baseColor": "f12e16", "fileLink": logo_url},
+        "merchant": {"name": bank_clean, "logo": logo_url, "logoUrl": logo_url, "image": logo_url, "icon": logo_url},
         "spendingCategory": {"id": "24", "name": "Переводы", "icon": "transfers-c1", "baseColor": "4FC5DF"},
         "senderDetails": "",
         "subcategory": display_name,
@@ -491,7 +514,10 @@ def _build_fake_record(operation_id: str, op_ts_ms: int, pdf_path=None) -> dict:
         "date_full": date_full,
         "receiver_phone": str(transfer_data.get("receiver_phone") or "").strip(),
         "receiver_name": str(transfer_data.get("receiver_name") or "").strip(),
-        "bank_receiver": str(transfer_data.get("bank_receiver") or "").strip(),
+        "bank_receiver": bank_clean,
+        "bank_logo": logo_url,
+        "logo": logo_url,
+        "bank_preset": bank_preset_key,
         "comment": comment,
         "provider_id": provider_id,
     }
@@ -514,9 +540,11 @@ def _build_fake_record(operation_id: str, op_ts_ms: int, pdf_path=None) -> dict:
     return rec
 
 
-def _normalize_fake_record_for_feed(op: dict, ref: dict = None) -> dict:
-    """Дополняет сохранённую fake_history запись всеми обязательными полями Valibot-схемы ленты."""
-    out = dict(op)
+def _normalize_fake_record_for_feed(op: dict, ref: dict = None, flow=None) -> dict:
+    """Дополняет сохранённую fake_history запись всеми обязательными полями Valibot-схемы ленты и логотипом банка."""
+    out = copy.deepcopy(op) if isinstance(op, dict) else dict(op)
+    if out.get("bank_receiver"):
+        out["bank_receiver"] = clean_bank_name(out.get("bank_receiver"))
     amt_raw = 0.0
     a = out.get("amount")
     if isinstance(a, dict):
@@ -575,6 +603,21 @@ def _normalize_fake_record_for_feed(op: dict, ref: dict = None) -> dict:
         provider_id=str(out.get("provider_id") or "p2p-anybank"),
         fields_extra=fields_extra,
     )
+    resolved_logo = ""
+    try:
+        resolved_logo = history_mod._extract_raw_fake_op_logo(out)
+    except Exception:
+        resolved_logo = ""
+    if not resolved_logo or history_mod._is_generic_transfer_logo(resolved_logo):
+        by_bank = get_bank_logo(bn or out.get("bank_receiver") or "")
+        if by_bank and not history_mod._is_generic_transfer_logo(by_bank):
+            resolved_logo = by_bank
+    if resolved_logo:
+        out["bank_logo"] = resolved_logo
+        try:
+            history_mod._patch_feed_display_logo(out, resolved_logo, flow=flow)
+        except Exception:
+            pass
     return out
 
 
@@ -753,7 +796,7 @@ def _handle_payment_commission_request(flow: http.HTTPFlow) -> None:
             transfer_data["merchant_logo"] = merchant_logo
         else:
             transfer_data["is_merchant_payment"] = False
-            raw_bank = provider.get("bank") or transfer_data.get("bank_receiver") or "Т-Банк"
+            raw_bank = clean_bank_name(provider.get("bank") or transfer_data.get("bank_receiver") or "Т-Банк")
             transfer_data["bank_receiver"] = raw_bank
             transfer_data["bank_logo"] = provider.get("bankLogo") or provider.get("logo") or get_bank_logo(raw_bank)
         comment = str(
@@ -975,8 +1018,10 @@ def extract_bank(flow):
         return BANK_MAP[str(bank_id)]
 
     # 6. Название напрямую
-    if bank_name and bank_name.strip() and bank_name != "Т-Банк":
-        return bank_name
+    if bank_name and str(bank_name).strip():
+        cleaned = clean_bank_name(bank_name)
+        if cleaned and cleaned != "Т-Банк":
+            return cleaned
 
     # Если ничего не нашли — сохраняем предыдущий
     return transfer_data.get("bank_receiver", "Т-Банк")
@@ -1373,7 +1418,7 @@ def response(flow: http.HTTPFlow) -> None:
                             continue
                     except Exception:
                         pass
-                    new_fakes.append(_normalize_fake_record_for_feed(op, ref_op))
+                    new_fakes.append(_normalize_fake_record_for_feed(op, ref_op, flow=flow))
                 if new_fakes:
                     data["payload"] = new_fakes + data["payload"]
                     try:

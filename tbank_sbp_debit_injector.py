@@ -443,11 +443,7 @@ class TBankSBPDebitInjector:
         for fake_item in fake_ops:
             fid = str(fake_item.get("id") or "")
             if fid and fid not in existing_ids:
-                fi = copy.deepcopy(fake_item)
-                if isinstance(ref_op, dict):
-                    for k in ("account", "card", "ucid"):
-                        if ref_op.get(k):
-                            fi[k] = ref_op[k]
+                fi = history._normalize_injected_fake_row(copy.deepcopy(fake_item), ref_op, flow=flow)
                 fake_injected.append(fi)
                 existing_ids.add(fid)
         if fake_injected:

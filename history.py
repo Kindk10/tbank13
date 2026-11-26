@@ -1195,17 +1195,100 @@ def _ensure_transfer_category_chip_icons(out: dict) -> None:
         bc.pop("logo", None)
 
 
-def _patch_feed_display_logo(out: dict, logo_url: str) -> None:
-    """Лого банка в brand/merchant; чип категории «Переводы» не трогаем."""
+def _clean_bank_label(val: str) -> str:
+    return str(val or "").replace("+", " ").strip()
+
+
+def _is_generic_transfer_logo(url: str) -> bool:
+    u = str(url or "").strip().lower()
+    if not u:
+        return True
+    return ("transfers-c1" in u) or ("dhjhbnNmzxjzlwm".lower() in u)
+
+
+def _extract_raw_fake_op_logo(op: dict) -> str:
+    """Извлекает фактический логотип банка для мок-операции (UNIFIED_*), не затирая его общим transfers-c1."""
+    if not isinstance(op, dict):
+        return ""
+    brand = op.get("brand") if isinstance(op.get("brand"), dict) else {}
+    merchant = op.get("merchant") if isinstance(op.get("merchant"), dict) else {}
+    candidates = [
+        op.get("bank_logo"),
+        op.get("merchant_logo"),
+        brand.get("logo"),
+        brand.get("fileLink"),
+        merchant.get("logo"),
+        merchant.get("logoUrl"),
+        op.get("icon"),
+        op.get("logo"),
+        op.get("logoUrl"),
+    ]
+    generic_fallback = ""
+    for raw in candidates:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        norm = _normalize_logo_url(s)
+        if not norm:
+            continue
+        if not _is_generic_transfer_logo(norm):
+            return norm
+        if not generic_fallback:
+            generic_fallback = norm
+    bank_label = _clean_bank_label(
+        op.get("bank_receiver")
+        or op.get("bank")
+        or merchant.get("name")
+        or ""
+    )
+    if bank_label:
+        by_label = _logo_from_bank_label(bank_label)
+        if by_label and not _is_generic_transfer_logo(by_label):
+            return by_label
+    preset_key = str(op.get("bank_preset") or "").strip().lower()
+    if preset_key and preset_key not in ("sbp", "custom"):
+        by_preset = _logo_from_bank_preset(preset_key)
+        if by_preset:
+            return by_preset
+    if generic_fallback:
+        return generic_fallback
+    return _logo_from_bank_preset("sbp")
+
+
+def _patch_feed_display_logo(out: dict, logo_url: str, flow=None) -> None:
+    """Лого банка в brand/merchant/counterparty/icon; чип категории «Переводы» не трогаем."""
     if not logo_url or not isinstance(out, dict):
         return
-    logo = _app_served_bank_logo_url(logo_url)
-    if isinstance(out.get("brand"), dict):
+    logo = _app_served_bank_logo_url(logo_url, flow=flow)
+    if not logo:
+        return
+    primary = str(out.get("description") or out.get("title") or out.get("receiver_name") or "Перевод").strip()
+    bank_name = _clean_bank_label(
+        out.get("bank_receiver")
+        or out.get("bank")
+        or (out.get("merchant") or {}).get("name")
+        or primary
+    )
+    if not isinstance(out.get("brand"), dict):
+        out["brand"] = {
+            "id": "11250",
+            "name": primary,
+            "logo": logo,
+            "baseColor": "f12e16",
+            "fileLink": logo,
+        }
+    else:
         out["brand"]["logo"] = logo
         out["brand"]["fileLink"] = logo
+        if not out["brand"].get("name"):
+            out["brand"]["name"] = primary
     out["icon"] = logo
-    if isinstance(out.get("merchant"), dict):
+    if not isinstance(out.get("merchant"), dict):
+        out["merchant"] = {"name": bank_name or primary, "logo": logo}
+    else:
         out["merchant"]["logo"] = logo
+        if bank_name and not out["merchant"].get("name"):
+            out["merchant"]["name"] = bank_name
     _propagate_merchant_logo(out)
     _ensure_transfer_category_chip_icons(out)
 
@@ -1224,7 +1307,7 @@ def _logo_from_bank_preset(preset_key: str) -> str:
 
 
 def _logo_from_bank_label(bank_label: str) -> str:
-    label = (bank_label or "").strip()
+    label = _clean_bank_label(bank_label)
     if not label:
         return ""
     low = label.lower()
@@ -1239,7 +1322,9 @@ def _logo_from_bank_label(bank_label: str) -> str:
         if not name:
             continue
         nl = name.lower()
-        if nl == low or nl in low or low in nl or str(key).lower() in low:
+        nl_c = re.sub(r"[\s\-_]+", "", nl)
+        low_c = re.sub(r"[\s\-_]+", "", low)
+        if nl == low or nl in low or low in nl or str(key).lower() in low or (nl_c and low_c and (nl_c in low_c or low_c in nl_c)):
             raw = (merchant.get("logo") or merchant.get("logoUrl") or merchant.get("image") or "").strip()
             if raw:
                 return _normalize_logo_url(raw)
@@ -1276,7 +1361,7 @@ _BANK_CATALOG_LOGO_KEYS = (
 
 
 def _guess_bank_preset_key(bank_label: str) -> str:
-    label = (bank_label or "").strip().lower()
+    label = _clean_bank_label(bank_label).lower()
     if not label:
         return "sbp"
     presets = load_merchant_presets()
@@ -1290,7 +1375,9 @@ def _guess_bank_preset_key(bank_label: str) -> str:
         if not name:
             continue
         nl = name.lower()
-        if nl == label or nl in label or label in nl or str(key).lower() in label:
+        nl_c = re.sub(r"[\s\-_]+", "", nl)
+        lbl_c = re.sub(r"[\s\-_]+", "", label)
+        if nl == label or nl in label or label in nl or str(key).lower() in label or (nl_c and lbl_c and (nl_c in lbl_c or lbl_c in nl_c)):
             return str(key).lower()
     return "sbp"
 
@@ -2732,10 +2819,14 @@ def apply_grouped_operations_spending_adjustments(data) -> bool:
     return modified
 
 
-def _normalize_injected_fake_row(row: dict, ref: Optional[dict] = None) -> dict:
-    """Дополняет fake_history запись полями Valibot-схемы ленты (categoryInfo, signedAmount, locations и т.д.)."""
+def _normalize_injected_fake_row(row: dict, ref: Optional[dict] = None, flow=None) -> dict:
+    """Дополняет fake_history запись полями Valibot-схемы ленты (categoryInfo, signedAmount, locations, логотип банка и т.д.)."""
     if not isinstance(row, dict):
         return row
+    if row.get("bank_receiver"):
+        row["bank_receiver"] = _clean_bank_label(row.get("bank_receiver"))
+    if row.get("bank"):
+        row["bank"] = _clean_bank_label(row.get("bank"))
     typ = operation_row_kind(row) or str(row.get("type") or "Debit")
     if typ not in ("Debit", "Credit"):
         typ = "Debit"
@@ -2810,6 +2901,10 @@ def _normalize_injected_fake_row(row: dict, ref: Optional[dict] = None) -> dict:
         provider_id=str(row.get("provider_id") or "p2p-anybank"),
         fields_extra=fields_extra,
     )
+    resolved_logo = _extract_raw_fake_op_logo(row)
+    if resolved_logo:
+        row["bank_logo"] = resolved_logo
+        _patch_feed_display_logo(row, resolved_logo, flow=flow)
     return row
 
 
@@ -3000,7 +3095,7 @@ def inject_manual_into_response(
                     continue
                 node = _normalize_injected_fake_row(copy.deepcopy(fake_item), ref_relay)
                 _coerce_money_fields_in_operation(node)
-                bl = (node.get("brand") or {}).get("logo") or (node.get("brand") or {}).get("fileLink") or node.get("icon")
+                bl = _extract_raw_fake_op_logo(node)
                 if bl:
                     _patch_feed_display_logo(node, str(bl))
                 lst.insert(0, {"cursor": f"fake_{op_id}", "node": node})
@@ -3070,7 +3165,7 @@ def inject_manual_into_response(
                 continue
             fake_row = _normalize_injected_fake_row(copy.deepcopy(fake_item), ref_list)
             _coerce_money_fields_in_operation(fake_row)
-            bl = (fake_row.get("brand") or {}).get("logo") or (fake_row.get("brand") or {}).get("fileLink") or fake_row.get("icon")
+            bl = _extract_raw_fake_op_logo(fake_row)
             if bl:
                 _patch_feed_display_logo(fake_row, str(bl))
             lst.insert(0, fake_row)
@@ -3458,13 +3553,15 @@ def _fake_transfer_ops_for_panel(skip_ids: set, month_only: bool = True) -> list
             date_s = (op.get("date_full") or "").strip() or get_op_date(op)
             rp = str(op.get("receiver_phone") or op.get("requisite_phone") or "").strip()
             rn = str(op.get("receiver_name") or op.get("requisite_sender_name") or "").strip()
-            brx = str(op.get("bank_receiver") or "").strip()
-            bank_display = _fake_bank_display_name(op) or brx
-            bank_preset = _guess_bank_preset_key(bank_display or brx)
+            brx = _clean_bank_label(op.get("bank_receiver") or op.get("bank") or "")
+            merch_name = _clean_bank_label((op.get("merchant") or {}).get("name") if isinstance(op.get("merchant"), dict) else "")
+            bank_display = brx or merch_name or _fake_bank_display_name(op)
+            bank_preset = _guess_bank_preset_key(brx or merch_name or bank_display)
+            raw_fake_logo = _extract_raw_fake_op_logo(op)
             fake_logo_op = {
-                "bank": bank_display or brx,
+                "bank": bank_display,
                 "bank_preset": bank_preset,
-                "logo": (op.get("bank_logo") or op.get("merchant_logo") or "").strip(),
+                "logo": raw_fake_logo,
             }
             out.append({
                 "id": oid,

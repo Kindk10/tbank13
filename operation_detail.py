@@ -91,13 +91,21 @@ def _fake_op_to_manual_shape(hop: dict) -> dict:
         title = "Операция" if typ == "Debit" else "Поступление"
     raw_sub = str(hop.get("subtitle") or "").strip()
     subtitle = raw_sub if raw_sub and raw_sub != title else "Переводы"
-    bank = str(hop.get("bank_receiver") or hop.get("bank") or (hop.get("brand") or {}).get("name") or "").strip()
+    merch_name = str((hop.get("merchant") or {}).get("name") or "").strip() if isinstance(hop.get("merchant"), dict) else ""
+    bank = str(hop.get("bank_receiver") or hop.get("bank") or merch_name or "").replace("+", " ").strip()
     phone = str(hop.get("receiver_phone") or hop.get("requisite_phone") or hop.get("phone") or "").strip()
     sender_name = str(hop.get("sender_name") or hop.get("requisite_sender_name") or "").strip()
     card_number = str(hop.get("receiver_card") or hop.get("card_number") or "").strip()
     pay = hop.get("payment") if isinstance(hop.get("payment"), dict) else {}
     provider_id = str(hop.get("provider_id") or pay.get("providerId") or "p2p-anybank").strip() or "p2p-anybank"
-    logo = str(hop.get("bank_logo") or hop.get("merchant_logo") or (hop.get("brand") or {}).get("logo") or "").strip()
+    logo = history._extract_raw_fake_op_logo(hop) if hasattr(history, "_extract_raw_fake_op_logo") else str(
+        hop.get("bank_logo")
+        or hop.get("merchant_logo")
+        or (hop.get("brand") or {}).get("logo")
+        or (hop.get("brand") or {}).get("fileLink")
+        or hop.get("icon")
+        or ""
+    ).strip()
     return {
         "id": oid,
         "date": date_s,
@@ -382,6 +390,21 @@ def _patch_receipt_like_node(obj: dict, man: dict) -> bool:
     if bank and isinstance(obj.get("merchant"), dict):
         obj["merchant"]["name"] = bank
         changed = True
+
+    raw_logo = history._resolve_manual_operation_logo(man) if hasattr(history, "_resolve_manual_operation_logo") else ""
+    if raw_logo:
+        served_logo = history._app_served_bank_logo_url(raw_logo)
+        if served_logo:
+            if isinstance(obj.get("brand"), dict):
+                obj["brand"]["logo"] = served_logo
+                obj["brand"]["fileLink"] = served_logo
+                changed = True
+            if isinstance(obj.get("merchant"), dict):
+                obj["merchant"]["logo"] = served_logo
+                changed = True
+            if "icon" in obj:
+                obj["icon"] = served_logo
+                changed = True
     elif bank and "merchant" in obj:
         obj["merchant"] = {"name": bank}
         changed = True
@@ -804,6 +827,8 @@ def response(flow: http.HTTPFlow) -> None:
         return
     if not flow.response:
         return
+    if hasattr(history, "_record_web_origin_from_flow"):
+        history._record_web_origin_from_flow(flow)
     url = flow.request.pretty_url or ""
     if callable(_is_telemetry_or_log_url) and _is_telemetry_or_log_url(url):
         return
