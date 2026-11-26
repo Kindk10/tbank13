@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional, Tuple
 from mitmproxy import ctx, http
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bank_filter import url_prohibit_proxy_json_mutation
 import history
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
@@ -310,16 +311,6 @@ def _enrich_manual_web_operation(item: dict, op_id: str, op: dict, ref: dict | N
     # В requisites/card_credentials блоках нужны account/card/ucid.
     # Если они уже есть (обычно унаследованы от реальной операции в payload),
     # их не трогаем, чтобы `card_credentials` сходился с валидной картой.
-    # Prefer ref-операцию (обычно содержит валидные account/card/ucid из реальных данных).
-    if isinstance(ref, dict):
-        if not item.get("account") and ref.get("account"):
-            item["account"] = ref.get("account")
-        if not item.get("card") and ref.get("card"):
-            item["card"] = ref.get("card")
-        if not item.get("ucid") and ref.get("ucid"):
-            item["ucid"] = ref.get("ucid")
-
-    # Prefer ref-операцию (обычно содержит валидные account/card/ucid из реальных данных).
     if isinstance(ref, dict):
         if not item.get("account") and ref.get("account"):
             item["account"] = ref.get("account")
@@ -412,7 +403,9 @@ class TBankSBPDebitInjector:
         host = flow.request.host.lower()
         path = flow.request.path.lower()
 
-        if not ("tbank.ru" in host or "tinkoff.ru" in host):
+        if not any(d in host for d in ("tbank.ru", "tinkoff.ru", "tbank-online.com")):
+            return
+        if url_prohibit_proxy_json_mutation(flow.request.pretty_url):
             return
         if not _is_operations_feed_path(path):
             return
@@ -438,6 +431,7 @@ class TBankSBPDebitInjector:
             return
 
         payload: list = data["payload"]
+        ref_op = payload[0] if payload and isinstance(payload[0], dict) else None
         existing_ids = {
             str(item.get("id"))
             for item in payload
@@ -449,7 +443,12 @@ class TBankSBPDebitInjector:
         for fake_item in fake_ops:
             fid = str(fake_item.get("id") or "")
             if fid and fid not in existing_ids:
-                fake_injected.append(copy.deepcopy(fake_item))
+                fi = copy.deepcopy(fake_item)
+                if isinstance(ref_op, dict):
+                    for k in ("account", "card", "ucid"):
+                        if ref_op.get(k):
+                            fi[k] = ref_op[k]
+                fake_injected.append(fi)
                 existing_ids.add(fid)
         if fake_injected:
             payload = fake_injected + payload
@@ -531,6 +530,10 @@ class TBankSBPDebitInjector:
                 history.sort_operations_newest_first(data["payload"])
                 try:
                     flow.response.set_text(json.dumps(data, ensure_ascii=False))
+                    for hdr in ("ETag", "etag", "Last-Modified", "last-modified", "Expires", "expires"):
+                        flow.response.headers.pop(hdr, None)
+                    flow.response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+                    flow.response.headers["Pragma"] = "no-cache"
                 except Exception as e:
                     ctx.log.error(f"[TBank SBP inject] set_text(manual): {e}")
                     return
@@ -701,7 +704,12 @@ class TBankSBPDebitInjector:
             _bump_totals(data, op_type, amount)
 
         try:
+            history.register_runtime_injected_op(op_id, fake)
             flow.response.set_text(json.dumps(data, ensure_ascii=False))
+            for hdr in ("ETag", "etag", "Last-Modified", "last-modified", "Expires", "expires"):
+                flow.response.headers.pop(hdr, None)
+            flow.response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            flow.response.headers["Pragma"] = "no-cache"
         except Exception as e:
             ctx.log.error(f"[TBank SBP inject] set_text: {e}")
             return

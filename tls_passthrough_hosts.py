@@ -27,14 +27,32 @@ try:
 except re.error:
     _EXTRA_RE = None
 
-# Хосты, для которых типичен 403 при перехваченном TLS (микрофронты «Справок» и др.).
+# Хосты, для которых типичен 403 при перехваченном TLS (микрофронты «Справок», статика, SSO-формы, CDN).
 _DEFAULT_SNIS = (
     "s3-msk.tinkoff.ru",
     "s3-msk.tbank.ru",
+    "s3-spb.tbank.ru",
+    "s3-spb.tinkoff.ru",
     "s3.tinkoff.ru",
     "s3.tbank.ru",
     "tmsg.tbank.ru",
     "tmsg.tinkoff.ru",
+    "cdn.tbank.ru",
+    "www.cdn-tinkoff.ru",
+    "unic-cdn-prod.cdn-tinkoff.ru",
+    "fallback.cdn-tinkoff.ru",
+    "brands-prod.cdn-tinkoff.ru",
+    "brands-static.cdn-tinkoff.ru",
+    "bms-logo-prod.t-static.ru",
+    "imgproxy.cdn-tinkoff.ru",
+    "sso-forms-prod.t-static.ru",
+    "sso-forms-prod.cdn-tinkoff.ru",
+    "sso-captcha-0.t-static.ru",
+    "csc-messenger-front.t-static.ru",
+    "content-hub.t-static.ru",
+    "acdn.tinkoff.ru",
+    "static.tbank.ru",
+    "static.tinkoff.ru",
 )
 
 

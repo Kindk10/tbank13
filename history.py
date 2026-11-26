@@ -59,6 +59,84 @@ operations_cache = {}
 manual_operations = {}
 hidden_operations = set()
 last_sync_time = None
+_bank_histogram_income = None
+_bank_histogram_expense = None
+_RUNTIME_INJECTED_FEED_OPS = {}
+
+OPERATIONS_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "operations_cache.json")
+
+
+def is_synthetic_op_id(op_id: str, op: Optional[dict] = None) -> bool:
+    """ID локально сгенерированных (ручных / мок) операций — не кэшируем как реальные операции банка."""
+    oid = str(op_id or "").strip()
+    if not oid:
+        return True
+    if oid.startswith(("m_", "UNIFIED_")) or oid == "777777777777":
+        return True
+    if isinstance(op, dict):
+        mk = str(op.get("merchantKey") or "")
+        if mk.startswith(("FAKE_SBP", "MANUAL_")):
+            return True
+    return False
+
+
+def register_runtime_injected_op(op_id: str, op: dict) -> None:
+    """Регистрирует инъектированную сторонним аддоном операцию для точного расчёта дневной гистограммы."""
+    oid = str(op_id or "").strip()
+    if oid and isinstance(op, dict):
+        _RUNTIME_INJECTED_FEED_OPS[oid] = copy.deepcopy(op)
+
+
+def _load_operations_cache_from_disk() -> None:
+    global operations_cache, _bank_histogram_income, _bank_histogram_expense
+    if not os.path.isfile(OPERATIONS_CACHE_FILE):
+        return
+    try:
+        with open(OPERATIONS_CACHE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            cached_ops = saved.get("operations")
+            src = cached_ops if isinstance(cached_ops, dict) else (saved if "operations" not in saved else {})
+            for k, v in (src or {}).items():
+                if not is_synthetic_op_id(k, v if isinstance(v, dict) else None):
+                    operations_cache[k] = v
+            raw_inc = saved.get("raw_histogram_income")
+            if raw_inc is None:
+                raw_inc = saved.get("histogram_income")
+            raw_exp = saved.get("raw_histogram_expense")
+            if raw_exp is None:
+                raw_exp = saved.get("histogram_expense")
+            if _bank_histogram_income is None and raw_inc is not None:
+                _bank_histogram_income = round(float(raw_inc), 2)
+            if _bank_histogram_expense is None and raw_exp is not None:
+                _bank_histogram_expense = round(float(raw_exp), 2)
+            if operations_cache and bank_debug_enabled():
+                print(f"[history] Загружен постоянный кэш операций с диска: {len(operations_cache)} шт.")
+    except Exception as e:
+        print(f"[history] operations_cache load error: {e}")
+
+
+def _save_operations_cache_to_disk() -> None:
+    try:
+        clean_ops = {
+            k: v
+            for k, v in operations_cache.items()
+            if not is_synthetic_op_id(k, v if isinstance(v, dict) else None)
+        }
+        payload = {
+            "operations": clean_ops,
+            "raw_histogram_income": _bank_histogram_income,
+            "raw_histogram_expense": _bank_histogram_expense,
+            "histogram_income": _bank_histogram_income,
+            "histogram_expense": _bank_histogram_expense,
+        }
+        with open(OPERATIONS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[history] operations_cache save error: {e}")
+
+
+_load_operations_cache_from_disk()
 
 DELETED_FAKE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deleted_fake_transfers.json")
 _deleted_fake_transfer_ids = set()
@@ -259,8 +337,6 @@ def _statement_strip_fio_from_text(text: str) -> str:
     return "\n".join(out).strip()
 
 # Последняя сводка доход/расход из ответа API Т‑Банка (как на /mybank/operations), до подмены.
-_bank_histogram_income = None
-_bank_histogram_expense = None
 
 
 def extract_histogram_totals_from_payload(data):
@@ -296,23 +372,66 @@ def extract_histogram_totals_from_payload(data):
     return inc, exp
 
 
-def record_bank_histogram_from_payload(data):
-    """Сохранить цифры сводки с сайта для панели и подмены (вызывать до replace_histogram)."""
+def record_bank_histogram_from_payload(data, url: str = ""):
+    """Сохранить чистые цифры сводки с сайта для панели и подмены (вызывать до replace_histogram)."""
     global _bank_histogram_income, _bank_histogram_expense
+    ul = (url or "").lower()
+    if any(
+        bad in ul
+        for bad in (
+            "operations_category_list",
+            "withouttransfer",
+            "without_transfer",
+            "groupfilter=without_transfer",
+        )
+    ):
+        return
+    # Предпочитаем полную месячную сводку: если уже есть значения из period=month, не перетираем их частичным period=day.
+    if "period=day" in ul and _bank_histogram_income is not None and _bank_histogram_expense is not None:
+        return
     inc, exp = extract_histogram_totals_from_payload(data)
+    updated_raw = False
     if inc is not None:
-        _bank_histogram_income = round(float(inc), 2)
+        val_inc = round(float(inc), 2)
+        if _bank_histogram_income != val_inc:
+            _bank_histogram_income = val_inc
+            updated_raw = True
     if exp is not None:
-        _bank_histogram_expense = round(float(exp), 2)
+        val_exp = round(float(exp), 2)
+        if _bank_histogram_expense != val_exp:
+            _bank_histogram_expense = val_exp
+            updated_raw = True
     if inc is not None or exp is not None:
+        if updated_raw:
+            try:
+                man = controller.config.setdefault("manual", {})
+                if _bank_histogram_income is not None:
+                    man["raw_bank_income"] = _bank_histogram_income
+                if _bank_histogram_expense is not None:
+                    man["raw_bank_expense"] = _bank_histogram_expense
+                controller.save_config()
+            except Exception:
+                pass
         print(f"[history] Сводка с сайта: доходы={_bank_histogram_income}, расходы={_bank_histogram_expense}")
         try:
             sync_manual_ie_panel_aggregate_into_config()
+            _save_operations_cache_to_disk()
         except Exception as e:
             print(f"[history] sync_manual_ie_panel_aggregate_into_config: {e}")
 
 
 def get_bank_histogram_totals():
+    global _bank_histogram_income, _bank_histogram_expense
+    if _bank_histogram_income is None or _bank_histogram_expense is None:
+        try:
+            man = controller.config.get("manual") or {}
+            # Читаем ТОЛЬКО raw_bank_*, никогда агрегат manual.income/expense (иначе двойной учёт при рестарте).
+            if _bank_histogram_income is None and man.get("raw_bank_income") is not None:
+                _bank_histogram_income = round(float(man["raw_bank_income"]), 2)
+            if _bank_histogram_expense is None and man.get("raw_bank_expense") is not None:
+                _bank_histogram_expense = round(float(man["raw_bank_expense"]), 2)
+        except Exception:
+            pass
     return _bank_histogram_income, _bank_histogram_expense
 
 
@@ -733,7 +852,7 @@ def load_fallback_operation_template():
 def url_allows_operation_inject(url: str) -> bool:
     """Не трогаем гистограммы, категории и служебные API — только похожие на ленту операций."""
     u = (url or "").lower()
-    if _url_is_mybank_certificates_statements_spa(u):
+    if _url_is_mybank_certificates_statements_spa(u) or url_prohibit_proxy_json_mutation(u):
         return False
     # Важно: не отрезаем «graphql» целиком — у Т‑Банка лента операций часто идёт через GraphQL JSON.
     for bad in (
@@ -745,7 +864,23 @@ def url_allows_operation_inject(url: str) -> bool:
         "session_status",
         "/event",
         "bundles",
+        "allbundles",
         "ping",
+        "my_invoices",
+        "invoices_to_pay",
+        "get_invoices",
+        "/cm/",
+        "openbanking",
+        "/now",
+        "tracker/",
+        "stories",
+        "settings",
+        "eventea",
+        "statist",
+        "analytics",
+        "telemetry",
+        "export",
+        "limits",
     ):
         if bad in u:
             return False
@@ -778,13 +913,8 @@ def url_allows_operation_inject(url: str) -> bool:
         "movements",
         "registry",
         "extract",
-        "certificate",
-        "reference",
         "fiscal",
         "ofd",
-        "slip",
-        "invoice",
-        "document",
     ):
         if good in u:
             return True
@@ -2172,6 +2302,290 @@ def _quick_fake_history_might_exist() -> bool:
     return False
 
 
+def _normalize_day_op_status_ok(op: dict) -> bool:
+    st = str(op.get("status") or "OK").strip().upper()
+    return st not in ("FAILED", "REJECTED", "CANCELED", "CANCELLED")
+
+
+def apply_daily_histogram_interval_adjustments(data, url: str = "") -> bool:
+    """
+    Корректирует дневные интервалы `spending.intervals[i].summary` в `operations_histogram?period=day`
+    с учётом ручных операций, мок-переводов (`fake_history`), runtime-инъекций и скрытых реальных операций.
+    Не изменяет top-level `spending.summary`.
+    """
+    if not isinstance(data, (dict, list)):
+        return False
+    ensure_manual_operations_fresh()
+    ul = (url or "").lower()
+    is_day_url = "period=day" in ul
+    exclude_transfers = any(
+        x in ul for x in ("withouttransfer", "without_transfer", "groupfilter=without_transfer")
+    )
+
+    seen_ids = set()
+    added_debits = []  # (ts_ms, amount)
+
+    for op_id, op in manual_operations.items():
+        oid = str(op_id or "").strip()
+        if not oid or oid in seen_ids or oid in hidden_operations or not isinstance(op, dict):
+            continue
+        seen_ids.add(oid)
+        if _coerce_inner_flag(op):
+            continue
+        if (op.get("type") or "Debit") != "Debit":
+            continue
+        if not _normalize_day_op_status_ok(op):
+            continue
+        op_grp = str(op.get("op_group") or op.get("group") or "TRANSFER").strip().upper()
+        if exclude_transfers and op_grp == "TRANSFER":
+            continue
+        ts_ms = parse_bank_date_str_to_ms(op.get("date"))
+        if ts_ms is None:
+            ot = op.get("operationTime")
+            if isinstance(ot, dict) and isinstance(ot.get("milliseconds"), (int, float)) and ot["milliseconds"] > 0:
+                ts_ms = int(ot["milliseconds"])
+        if ts_ms is None:
+            ts_ms = date_str_to_millis(op.get("date", ""))
+        amt = abs(float(op.get("amount") or 0))
+        if ts_ms > 0 and amt > 0:
+            added_debits.append((int(ts_ms), amt))
+
+    for fop in pending_fake_history_ops(month_restrict=False):
+        oid = str(fop.get("id") or "").strip()
+        if not oid or oid in seen_ids or oid in hidden_operations or is_fake_transfer_deleted(oid):
+            continue
+        seen_ids.add(oid)
+        if _coerce_inner_flag(fop):
+            continue
+        if operation_row_kind(fop) != "Debit":
+            continue
+        if not _normalize_day_op_status_ok(fop):
+            continue
+        op_grp = str(fop.get("group") or fop.get("op_group") or "TRANSFER").strip().upper()
+        if exclude_transfers and op_grp == "TRANSFER":
+            continue
+        ts_ms = operation_time_ms(fop)
+        amt = get_op_amount(fop)
+        if ts_ms > 0 and amt > 0:
+            added_debits.append((int(ts_ms), amt))
+
+    for roid, rop in list(_RUNTIME_INJECTED_FEED_OPS.items()):
+        oid = str(roid or "").strip()
+        if not oid or oid in seen_ids or oid in hidden_operations or not isinstance(rop, dict):
+            continue
+        seen_ids.add(oid)
+        if _coerce_inner_flag(rop):
+            continue
+        if operation_row_kind(rop) != "Debit":
+            continue
+        if not _normalize_day_op_status_ok(rop):
+            continue
+        op_grp = str(rop.get("group") or rop.get("op_group") or "TRANSFER").strip().upper()
+        if exclude_transfers and op_grp == "TRANSFER":
+            continue
+        ts_ms = operation_time_ms(rop)
+        amt = get_op_amount(rop)
+        if ts_ms > 0 and amt > 0:
+            added_debits.append((int(ts_ms), amt))
+
+    removed_debits = []
+    for hid in hidden_operations:
+        hid_s = str(hid or "").strip()
+        if not hid_s or hid_s in manual_operations or is_synthetic_op_id(hid_s):
+            continue
+        cached = operations_cache.get(hid_s)
+        if not isinstance(cached, dict) or cached.get("is_inner"):
+            continue
+        if str(cached.get("type") or "").strip() != "Debit":
+            continue
+        c_grp = str(cached.get("op_group") or "").strip().upper()
+        if exclude_transfers and c_grp == "TRANSFER":
+            continue
+        ts_ms = cached.get("operation_time_ms") or operation_time_ms(cached) or parse_bank_date_str_to_ms(cached.get("date"))
+        amt = abs(float(cached.get("amount") or 0))
+        if ts_ms and ts_ms > 0 and amt > 0:
+            removed_debits.append((int(ts_ms), amt))
+
+    if not added_debits and not removed_debits:
+        return False
+
+    modified = False
+
+    def adjust_intervals(intervals: list) -> None:
+        nonlocal modified
+        for idx, iv in enumerate(intervals):
+            if not isinstance(iv, dict):
+                continue
+            s_raw = iv.get("start")
+            e_raw = iv.get("end")
+            if not isinstance(s_raw, (int, float)) or not isinstance(e_raw, (int, float)):
+                continue
+            iv_start = int(s_raw)
+            iv_end = int(e_raw)
+            span = iv_end - iv_start
+            if not is_day_url and not (0 < span <= 40 * 3600 * 1000):
+                continue
+            if span <= 0 or span > 40 * 3600 * 1000:
+                continue
+            match_end = iv_end
+            if span < 86000000:
+                next_iv = intervals[idx + 1] if idx + 1 < len(intervals) and isinstance(intervals[idx + 1], dict) else None
+                next_s = int(next_iv["start"]) if next_iv and isinstance(next_iv.get("start"), (int, float)) else None
+                cap = iv_start + 86399999
+                if next_s is not None and next_s > iv_start:
+                    cap = min(cap, next_s - 1)
+                if cap > match_end:
+                    match_end = cap
+
+            add_sum = sum(amt for ts, amt in added_debits if iv_start <= ts <= match_end)
+            rem_sum = sum(amt for ts, amt in removed_debits if iv_start <= ts <= match_end)
+            if add_sum == 0.0 and rem_sum == 0.0:
+                continue
+
+            orig_summary = iv.get("summary")
+            orig_val = float(orig_summary.get("value") or 0) if isinstance(orig_summary, dict) else 0.0
+            new_val = max(0.0, round(orig_val + add_sum - rem_sum, 2))
+            if new_val > 0:
+                cur = (
+                    dict(orig_summary["currency"])
+                    if isinstance(orig_summary, dict) and isinstance(orig_summary.get("currency"), dict)
+                    else _rub_currency_obj()
+                )
+                val_out = int(new_val) if abs(new_val - int(new_val)) < 1e-9 else new_val
+                iv["summary"] = {"value": val_out, "currency": cur}
+            else:
+                iv.pop("summary", None)
+            modified = True
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            sp = node.get("spending")
+            if isinstance(sp, dict) and isinstance(sp.get("intervals"), list):
+                adjust_intervals(sp["intervals"])
+            for k, v in node.items():
+                if k != "spending" and isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    walk(item)
+
+    walk(data)
+    return modified
+
+
+def apply_grouped_operations_spending_adjustments(data) -> bool:
+    """Если в JSON ответе есть сгруппированные по дням операции со сводкой трат дня (spending/total/sum),
+    пересчитывает сумму трат группы с учётом всех не-внутренних Debit операций."""
+    if not isinstance(data, (dict, list)):
+        return False
+    modified = False
+
+    def visit(node):
+        nonlocal modified
+        if isinstance(node, dict):
+            for ops_key in ("operations", "items", "feedItems", "transactions", "edges"):
+                if ops_key in node and isinstance(node[ops_key], list):
+                    ops_list = node[ops_key]
+                    rows = [
+                        (x["node"] if isinstance(x, dict) and isinstance(x.get("node"), dict) else x)
+                        for x in ops_list
+                    ]
+                    rows = [r for r in rows if isinstance(r, dict)]
+                    if rows and (rows[0].get("id") or "amount" in rows[0]):
+                        day_debit = 0.0
+                        for op_row in rows:
+                            oid = str(op_row.get("id") or "").strip()
+                            if oid and oid in hidden_operations:
+                                continue
+                            if _coerce_inner_flag(op_row):
+                                continue
+                            if not _normalize_day_op_status_ok(op_row):
+                                continue
+                            if operation_row_kind(op_row) == "Debit":
+                                day_debit += get_op_amount(op_row)
+                        rounded_debit = int(round(day_debit, 2)) if abs(round(day_debit, 2) - int(round(day_debit, 2))) < 1e-9 else round(day_debit, 2)
+                        for spend_key in ("spending", "totalExpense", "dailyTotal", "expense"):
+                            if spend_key in node:
+                                target = node[spend_key]
+                                if isinstance(target, dict) and "value" in target:
+                                    target["value"] = rounded_debit
+                                    modified = True
+                                elif isinstance(target, (int, float)):
+                                    node[spend_key] = rounded_debit
+                                    modified = True
+            for v in node.values():
+                visit(v)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(data)
+    return modified
+
+
+def _normalize_injected_fake_row(row: dict, ref: Optional[dict] = None) -> dict:
+    """Дополняет fake_history запись полями Valibot-схемы ленты (categoryInfo, signedAmount, locations и т.д.)."""
+    if not isinstance(row, dict):
+        return row
+    typ = operation_row_kind(row) or str(row.get("type") or "Debit")
+    if typ not in ("Debit", "Credit"):
+        typ = "Debit"
+    amt = abs(float(get_op_amount(row) or 0))
+    amt_val = int(amt) if abs(amt - int(amt)) < 1e-9 else round(amt, 2)
+    rub_cur = _rub_currency_obj()
+    title = str(row.get("description") or row.get("name") or row.get("receiver_name") or "Перевод").strip()
+    row.setdefault("type", typ)
+    row.setdefault("operationType", typ)
+    row.setdefault("status", "OK")
+    row.setdefault("signedAmount", {"value": -amt_val if typ == "Debit" else amt_val, "currency": dict(rub_cur)})
+    row.setdefault("debitAmount", {"value": amt_val if typ == "Debit" else 0.0, "currency": dict(rub_cur)})
+    row.setdefault("creditAmount", {"value": amt_val if typ == "Credit" else 0.0, "currency": dict(rub_cur)})
+    row.setdefault("cashback", 0.0)
+    row.setdefault("cashbackAmount", {"value": 0.0, "currency": dict(rub_cur)})
+    if not isinstance(row.get("locations"), list):
+        row["locations"] = []
+    if not isinstance(row.get("offers"), list):
+        row["offers"] = []
+    if not isinstance(row.get("tags"), list):
+        row["tags"] = []
+    if not isinstance(row.get("merges"), list):
+        row["merges"] = []
+    if not isinstance(row.get("loyaltyBonus"), list):
+        row["loyaltyBonus"] = []
+    if not isinstance(row.get("loyaltyPayment"), list):
+        row["loyaltyPayment"] = []
+    if not isinstance(row.get("loyaltyBonusSummary"), dict):
+        row["loyaltyBonusSummary"] = {"amount": 0.0}
+    ci = row.get("categoryInfo")
+    if not isinstance(ci, dict) or not isinstance(ci.get("metacategory"), dict) or not isinstance(ci.get("criteria"), dict):
+        row["categoryInfo"] = {
+            "bankCategory": {
+                "id": "24",
+                "language": "ru",
+                "name": "Переводы",
+                "baseColor": "4FC5DF",
+                "fileLink": "https://brands-prod.cdn-tinkoff.ru/general_logo/transfers-c1.png",
+            },
+            "metacategory": {
+                "id": "12",
+                "language": "ru",
+                "name": "Финансы",
+                "baseColor": "14B8AF",
+                "fileLink": "https://bms-logo-prod.t-static.ru/general_logo/finance-3-meta.png",
+            },
+            "criteria": {"bulkVariety": {"type": "Description", "value": title[:200]}},
+        }
+    if not row.get("date") and row.get("date_full"):
+        row["date"] = row["date_full"]
+    if isinstance(ref, dict):
+        for k in ("account", "card", "ucid"):
+            if ref.get(k):
+                row[k] = ref[k]
+    row["isInner"] = bool(_coerce_inner_flag(row)) if "is_inner" in row else False
+    return row
+
+
 def inject_manual_into_response(
     data,
     url: str,
@@ -2188,13 +2602,22 @@ def inject_manual_into_response(
     if _flow_is_statements_certificates_context(url, referer, request_text):
         return False
     url_u = (url or "").lower()
-    if "operations_category_list" in url_u:
+    if "operations_category_list" in url_u or "histogram" in url_u:
         return False
     page_kind = _mybank_page_kind(referer)
     request_feed_like = _request_looks_like_operations_feed(request_text)
     product_surface = _response_looks_like_product_surface(data)
-    if page_kind == "" and request_feed_like and not product_surface:
-        if referer_indicates_mybank(referer, "operations"):
+    is_strict_ops_feed = (
+        (
+            "/api/common/v1/operations" in url_u
+            or "/legacy/v1/operations" in url_u
+            or ("/timeline/" in url_u and "/operations" in url_u)
+        )
+        and "operations_category_list" not in url_u
+        and "histogram" not in url_u
+    )
+    if page_kind == "" and (is_strict_ops_feed or (request_feed_like and not product_surface)):
+        if referer_indicates_mybank(referer, "operations") or is_strict_ops_feed:
             page_kind = "operations"
     candidates = _candidate_operation_lists_from_data(
         data,
@@ -2202,25 +2625,26 @@ def inject_manual_into_response(
         allow_widget_containers=(page_kind == "operations" and not product_surface),
     )
     has_operation_candidates = bool(candidates)
-    is_strict_ops_feed = "/api/common/v1/operations" in url_u and "operations_category_list" not in url_u
-    # Главная /mybank/: на десктопе только strict ops feed. WebView / Potatso — без обязательного «прогрева» ленты.
-    if page_kind == "mybank" and _ua_looks_like_desktop_browser(user_agent) and not is_strict_ops_feed:
+    web_inject_all = os.environ.get("BANK_WEB_INJECT_ALL", "").strip() == "1"
+    if not web_inject_all:
+        # Главная /mybank/: на десктопе только strict ops feed. WebView / Potatso — без обязательного «прогрева» ленты.
+        if page_kind == "mybank" and _ua_looks_like_desktop_browser(user_agent) and not is_strict_ops_feed:
+            return False
+        if _ua_looks_like_desktop_browser(user_agent) and not (
+            is_strict_ops_feed or page_kind == "operations"
+        ):
+            return False
+    if product_surface and page_kind != "operations" and not web_inject_all:
         return False
-    if _ua_looks_like_desktop_browser(user_agent) and not (
-        is_strict_ops_feed or page_kind == "operations"
-    ):
-        return False
-    if product_surface and page_kind != "operations":
-        return False
-    if not url_allows_operation_inject(url) and not has_operation_candidates:
+    if not url_allows_operation_inject(url) and not is_strict_ops_feed and not has_operation_candidates:
         return False
     if page_kind == "mybank" and _block_manual_inject_browser_tbank(url, user_agent):
         return False
     if page_kind != "operations" and page_kind != "mybank" and _block_manual_inject_browser_tbank(
         url, user_agent
-    ) and not has_operation_candidates:
+    ) and not has_operation_candidates and not is_strict_ops_feed:
         return False
-    if page_kind != "operations" and _graphql_manual_inject_noise_request(
+    if page_kind != "operations" and not is_strict_ops_feed and _graphql_manual_inject_noise_request(
         url, request_text
     ) and not has_operation_candidates:
         return False
@@ -2231,10 +2655,23 @@ def inject_manual_into_response(
     if not pending and not pending_fake:
         return False
 
+    url_end_ms = None
+    try:
+        qs_end = parse_qs(urlparse(url).query).get("end")
+        if qs_end and qs_end[0].isdigit():
+            url_end_ms = int(qs_end[0])
+    except Exception:
+        url_end_ms = None
+
     changed = False
     injected_ids = set()
     _inject_logo_cache: dict = {}
-    use_cross_debounce = _ua_looks_like_desktop_browser(user_agent)
+    use_cross_debounce = (
+        _ua_looks_like_desktop_browser(user_agent)
+        and not is_strict_ops_feed
+        and "/operations" not in url_u
+        and "/timeline/" not in url_u
+    )
 
     def _inject_logo_for_op(op_id: str, op: dict) -> str:
         cached = _inject_logo_cache.get(op_id)
@@ -2323,6 +2760,7 @@ def inject_manual_into_response(
                 manual_tie = 1 if oid.startswith("m_") else 0
                 return (operation_time_ms(e["node"]), manual_tie)
 
+            ref_relay = nodes_list[0] if nodes_list else fallback_tpl
             for fake_item in pending_fake:
                 op_id = fake_item.get("id")
                 if not op_id or op_id in existing_ids:
@@ -2331,7 +2769,9 @@ def inject_manual_into_response(
                     continue
                 if use_cross_debounce and _cross_response_inject_debounce_hit(op_id):
                     continue
-                node = copy.deepcopy(fake_item)
+                if url_end_ms is not None and operation_time_ms(fake_item) > url_end_ms + 12 * 3600 * 1000:
+                    continue
+                node = _normalize_injected_fake_row(copy.deepcopy(fake_item), ref_relay)
                 _coerce_money_fields_in_operation(node)
                 bl = (node.get("brand") or {}).get("logo") or (node.get("brand") or {}).get("fileLink") or node.get("icon")
                 if bl:
@@ -2360,6 +2800,9 @@ def inject_manual_into_response(
                 continue
             if use_cross_debounce and _cross_response_inject_debounce_hit(op_id):
                 continue
+            op_ms_est = parse_bank_date_str_to_ms(op.get("date")) or date_str_to_millis(op.get("date", ""))
+            if url_end_ms is not None and op_ms_est > url_end_ms + 12 * 3600 * 1000:
+                continue
             typ = op.get("type") or "Debit"
             template = pick_template_for_type(lst, typ)
             if template is None:
@@ -2387,6 +2830,7 @@ def inject_manual_into_response(
                 _cross_response_inject_mark(op_id)
             changed = True
 
+        ref_list = lst[0] if lst and isinstance(lst[0], dict) else fallback_tpl
         for fake_item in pending_fake:
             op_id = fake_item.get("id")
             if not op_id or op_id in existing_ids:
@@ -2395,7 +2839,9 @@ def inject_manual_into_response(
                 continue
             if use_cross_debounce and _cross_response_inject_debounce_hit(op_id):
                 continue
-            fake_row = copy.deepcopy(fake_item)
+            if url_end_ms is not None and operation_time_ms(fake_item) > url_end_ms + 12 * 3600 * 1000:
+                continue
+            fake_row = _normalize_injected_fake_row(copy.deepcopy(fake_item), ref_list)
             _coerce_money_fields_in_operation(fake_row)
             bl = (fake_row.get("brand") or {}).get("logo") or (fake_row.get("brand") or {}).get("fileLink") or fake_row.get("icon")
             if bl:
@@ -2424,6 +2870,8 @@ def inject_manual_into_response(
             merge_into_list(primary, share_injected_ids=not multi_transfer)
         if apply_manual_transfer_summary_adjustments(data, url):
             changed = True
+        if apply_grouped_operations_spending_adjustments(data):
+            changed = True
         return changed
 
     if multi_transfer and candidates:
@@ -2433,10 +2881,15 @@ def inject_manual_into_response(
         primary = pick_primary_operation_list(candidates)
         if primary is not None:
             merge_into_list(primary, share_injected_ids=True)
-        elif page_kind != "mybank":
+        elif page_kind != "mybank" and url_allows_operation_inject(url):
             for field in ("payload", "items", "operations"):
-                if field in data and isinstance(data[field], list):
-                    merge_into_list(data[field], share_injected_ids=True)
+                val = data.get(field)
+                if isinstance(val, list) and (
+                    _list_looks_like_operation_feed(val, field)
+                    or _list_looks_like_transfer_feed(val, field)
+                    or (len(val) == 0 and field == "payload" and is_strict_ops_feed)
+                ):
+                    merge_into_list(val, share_injected_ids=True)
             for key, val in data.items():
                 if key in ("payload", "items", "operations"):
                     continue
@@ -2450,6 +2903,8 @@ def inject_manual_into_response(
                     merge_into_list(val, share_injected_ids=True)
 
     if apply_manual_transfer_summary_adjustments(data, url):
+        changed = True
+    if apply_grouped_operations_spending_adjustments(data):
         changed = True
     if changed and bank_debug_enabled():
         print(f"[history] ✓ подменён ответ (ручные операции): {url[:130]}")
@@ -3557,9 +4012,14 @@ _STMT_TRANSFER_PRESETS = frozenset(
 
 
 def _coerce_inner_flag(op: dict) -> bool:
-    if not isinstance(op, dict) or "isInner" not in op:
+    if not isinstance(op, dict):
         return False
-    v = op.get("isInner")
+    if "isInner" in op:
+        v = op.get("isInner")
+    elif "is_inner" in op:
+        v = op.get("is_inner")
+    else:
+        return False
     if isinstance(v, bool):
         return v
     return str(v).lower() in ("true", "1", "yes")
@@ -4239,11 +4699,16 @@ def response(flow: http.HTTPFlow) -> None:
                 merged = 0
                 for op in ops:
                     op_id = str(op.get("id") or "").strip()
-                    if not op_id or op_id in manual_operations or is_fake_transfer_deleted(op_id):
+                    if not op_id or op_id in manual_operations or is_fake_transfer_deleted(op_id) or is_synthetic_op_id(op_id, op):
                         continue
                     if op_id in operations_cache:
                         if merge_ops_cache_from_bank_op(op_id, op):
                             merged += 1
+                        if not operations_cache[op_id].get("operation_time_ms"):
+                            op_ms_v = operation_time_ms(op)
+                            if op_ms_v > 0:
+                                operations_cache[op_id]["operation_time_ms"] = op_ms_v
+                                merged += 1
                         continue
                     phone_pick = _statement_extract_transfer_phone(op)
                     if not phone_pick:
@@ -4259,6 +4724,7 @@ def response(flow: http.HTTPFlow) -> None:
                     operations_cache[op_id] = {
                         "id": op_id,
                         "date": get_op_date(op),
+                        "operation_time_ms": operation_time_ms(op),
                         "amount": get_op_amount(op),
                         "type": get_op_type(op) or "Debit",
                         "operationType": str(op.get("operationType") or "")[:40],
@@ -4284,9 +4750,12 @@ def response(flow: http.HTTPFlow) -> None:
                 if new_ops:
                     print(f"[history] Добавлено {new_ops} новых операций")
                     clean_old_ops()
+                    _save_operations_cache_to_disk()
                 if new_ops or merged:
                     if merged and bank_debug_enabled():
                         print(f"[history] Обновлено из повторного ответа: {merged} операций")
+                    if merged:
+                        _save_operations_cache_to_disk()
                     last_sync_time = datetime.now()
 
         filtered = False
@@ -4302,6 +4771,10 @@ def response(flow: http.HTTPFlow) -> None:
             if isinstance(data, (dict, list)):
                 try:
                     flow.response.text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                    for hdr in ("ETag", "etag", "Last-Modified", "last-modified", "Expires", "expires"):
+                        flow.response.headers.pop(hdr, None)
+                    flow.response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+                    flow.response.headers["Pragma"] = "no-cache"
                 except (TypeError, ValueError) as ser_ex:
                     print(f"[history] json.dumps после патча: {ser_ex}")
             else:
@@ -4314,6 +4787,12 @@ def response(flow: http.HTTPFlow) -> None:
 def request(flow: http.HTTPFlow) -> None:
     global hidden_operations, last_sync_time
     ensure_manual_operations_fresh()
+
+    if flow.request and is_bank_flow(flow):
+        _p_low = (flow.request.path or "").split("?", 1)[0].lower()
+        if ("/operations" in _p_low or "operations_histogram" in _p_low) and not _url_is_mybank_certificates_statements_spa(flow.request.pretty_url):
+            for hdr in ("If-None-Match", "if-none-match", "If-Modified-Since", "if-modified-since"):
+                flow.request.headers.pop(hdr, None)
 
     via_bank_https = bank_https_panel_request(flow)
     if not via_bank_https and not request_is_panel_mitm_port(flow, 8082):

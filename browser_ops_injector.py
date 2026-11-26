@@ -1,4 +1,4 @@
-﻿from mitmproxy import http
+from mitmproxy import http
 import json
 import os
 import re
@@ -41,6 +41,46 @@ def _effective_balance_for_display() -> float:
         return round(base, 2)
 
 
+def _js_json(obj) -> str:
+    """Serialize obj safely for embedding inside an HTML <script> block."""
+    return (
+        json.dumps(obj, ensure_ascii=False)
+        .replace("</", "<\\/")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _extract_op_ms(op: dict) -> int:
+    """Extract epoch milliseconds from operationTime, date string, or sort_ts; 0 if unavailable."""
+    if not isinstance(op, dict):
+        return 0
+    ot = op.get("operationTime")
+    if isinstance(ot, dict):
+        ms = ot.get("milliseconds")
+        if isinstance(ms, (int, float)) and ms > 0:
+            return int(ms)
+        sec = ot.get("seconds")
+        if isinstance(sec, (int, float)) and sec > 0:
+            return int(sec * 1000)
+    date_str = str(op.get("date") or "").strip()
+    if date_str:
+        ms_bank = history.parse_bank_date_str_to_ms(date_str)
+        if ms_bank and ms_bank > 0:
+            return int(ms_bank)
+        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", date_str):
+            ms_day = history.parse_bank_date_str_to_ms(f"{date_str}, 12:00:00")
+            if ms_day and ms_day > 0:
+                return int(ms_day)
+        ms_iso = history.parse_iso_date_to_ms(date_str)
+        if ms_iso and ms_iso > 0:
+            return int(ms_iso)
+    st = op.get("sort_ts")
+    if isinstance(st, (int, float)) and st > 0:
+        return int(st)
+    return 0
+
+
 def _manual_ops_payload():
     history.ensure_manual_operations_fresh()
     show_all = history.app_include_all_operations()
@@ -50,28 +90,33 @@ def _manual_ops_payload():
             continue
         if not show_all and not history.is_current_month(op.get("date", "")):
             continue
-        items.append(
-            {
-                "id": op_id,
-                "date": op.get("date", ""),
-                "amount": float(op.get("amount") or 0),
-                "type": op.get("type") or "Debit",
-                "title": op.get("title") or "",
-                "subtitle": op.get("subtitle") or "",
-                "description": op.get("description") or "",
-                "bank": op.get("bank") or "",
-                "bank_preset": (op.get("bank_preset") or "custom").lower(),
-                "logo": (op.get("logo") or "").strip(),
-                "app_logo": history._app_served_bank_logo_url(
-                    history._resolve_manual_operation_logo(op)
-                ),
-                "phone": op.get("phone") or "",
-                "requisite_phone": op.get("requisite_phone") or op.get("phone") or "",
-                "sender_name": op.get("sender_name") or "",
-                "requisite_sender_name": op.get("requisite_sender_name") or op.get("sender_name") or "",
-                "card_number": op.get("card_number") or "",
-            }
-        )
+        op_ms = _extract_op_ms(op)
+        row_item = {
+            "id": op_id,
+            "date": op.get("date", ""),
+            "sort_ts": op_ms,
+            "amount": float(op.get("amount") or 0),
+            "type": op.get("type") or "Debit",
+            "title": op.get("title") or "",
+            "subtitle": op.get("subtitle") or "",
+            "description": op.get("description") or "",
+            "bank": op.get("bank") or "",
+            "bank_preset": (op.get("bank_preset") or "custom").lower(),
+            "logo": (op.get("logo") or "").strip(),
+            "app_logo": history._app_served_bank_logo_url(
+                history._resolve_manual_operation_logo(op)
+            ),
+            "phone": op.get("phone") or "",
+            "requisite_phone": op.get("requisite_phone") or op.get("phone") or "",
+            "sender_name": op.get("sender_name") or "",
+            "requisite_sender_name": op.get("requisite_sender_name") or op.get("sender_name") or "",
+            "card_number": op.get("card_number") or "",
+            "is_inner": bool(op.get("is_inner") or op.get("isInner")),
+            "manual": True,
+        }
+        if op_ms > 0:
+            row_item["operationTime"] = {"milliseconds": op_ms, "seconds": op_ms / 1000.0}
+        items.append(row_item)
     skip_ids = set(history.manual_operations.keys())
     month_only = not show_all
     for row in history._fake_transfer_ops_for_panel(skip_ids, month_only=month_only):
@@ -82,29 +127,34 @@ def _manual_ops_payload():
             "bank_preset": (row.get("bank_preset") or "sbp").lower(),
             "logo": (row.get("logo") or "").strip(),
         }
-        items.append(
-            {
-                "id": row["id"],
-                "date": row.get("date") or "",
-                "amount": float(row.get("amount") or 0),
-                "type": row.get("type") or "Debit",
-                "title": row.get("title") or row.get("desc") or "",
-                "subtitle": row.get("subtitle") or "",
-                "description": row.get("description") or "",
-                "bank": row.get("bank") or "",
-                "bank_preset": (row.get("bank_preset") or "sbp").lower(),
-                "logo": (row.get("logo") or "").strip(),
-                "app_logo": history._app_served_bank_logo_url(
-                    history._resolve_manual_operation_logo(fake_logo_op)
-                ),
-                "phone": row.get("phone") or row.get("requisite_phone") or "",
-                "requisite_phone": row.get("requisite_phone") or row.get("phone") or "",
-                "sender_name": row.get("sender_name") or "",
-                "requisite_sender_name": row.get("requisite_sender_name") or row.get("sender_name") or "",
-                "card_number": row.get("card_number") or "",
-            }
-        )
-    items.sort(key=lambda x: history.date_str_to_millis(x.get("date", "")), reverse=True)
+        op_ms = _extract_op_ms(row)
+        row_item = {
+            "id": row["id"],
+            "date": row.get("date") or "",
+            "sort_ts": op_ms,
+            "amount": float(row.get("amount") or 0),
+            "type": row.get("type") or "Debit",
+            "title": row.get("title") or row.get("desc") or "",
+            "subtitle": row.get("subtitle") or "",
+            "description": row.get("description") or "",
+            "bank": row.get("bank") or "",
+            "bank_preset": (row.get("bank_preset") or "sbp").lower(),
+            "logo": (row.get("logo") or "").strip(),
+            "app_logo": history._app_served_bank_logo_url(
+                history._resolve_manual_operation_logo(fake_logo_op)
+            ),
+            "phone": row.get("phone") or row.get("requisite_phone") or "",
+            "requisite_phone": row.get("requisite_phone") or row.get("phone") or "",
+            "sender_name": row.get("sender_name") or "",
+            "requisite_sender_name": row.get("requisite_sender_name") or row.get("sender_name") or "",
+            "card_number": row.get("card_number") or "",
+            "is_inner": bool(row.get("is_inner") or row.get("isInner")),
+            "fake_transfer": True,
+        }
+        if op_ms > 0:
+            row_item["operationTime"] = {"milliseconds": op_ms, "seconds": op_ms / 1000.0}
+        items.append(row_item)
+    items.sort(key=lambda x: x.get("sort_ts") or history.date_str_to_millis(x.get("date", "")), reverse=True)
     return items
 
 
@@ -220,24 +270,22 @@ def _action_buttons_credit_inner_html() -> str:
 
 
 def _build_script() -> str:
-    manual_json = json.dumps(_manual_ops_payload(), ensure_ascii=False)
-    detail_ops_json = json.dumps(_detail_ops_by_id_payload(), ensure_ascii=False)
-    presets_json = json.dumps(_preset_payload(), ensure_ascii=False)
+    manual_json = _js_json(_manual_ops_payload())
+    detail_ops_json = _js_json(_detail_ops_by_id_payload())
+    presets_json = _js_json(_preset_payload())
     balance_value = _effective_balance_for_display()
     whole, frac = f"{balance_value:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ").split(",")
     balance_text = f"{whole},{frac}\u00a0₽"
-    manual_account_card_inner = json.dumps(_ACCOUNT_CARD_MANUAL_INNER_HTML, ensure_ascii=False)
-    manual_account_cards_shell = json.dumps(_ACCOUNT_CARDS_MANUAL_SHELL_HTML, ensure_ascii=False)
-    manual_bank_details_inner = json.dumps(_BANK_DETAILS_MANUAL_INNER_HTML, ensure_ascii=False)
-    manual_actions_row_inner = json.dumps(_action_buttons_row_inner_html(), ensure_ascii=False)
-    manual_actions_disallow_only = json.dumps(_action_buttons_disallow_only_inner_html(), ensure_ascii=False)
-    manual_actions_credit = json.dumps(_action_buttons_credit_inner_html(), ensure_ascii=False)
-    panel_origin_js = json.dumps(_panel_fetch_origin(), ensure_ascii=False)
+    manual_account_card_inner = _js_json(_ACCOUNT_CARD_MANUAL_INNER_HTML)
+    manual_account_cards_shell = _js_json(_ACCOUNT_CARDS_MANUAL_SHELL_HTML)
+    manual_bank_details_inner = _js_json(_BANK_DETAILS_MANUAL_INNER_HTML)
+    manual_actions_row_inner = _js_json(_action_buttons_row_inner_html())
+    manual_actions_disallow_only = _js_json(_action_buttons_disallow_only_inner_html())
+    manual_actions_credit = _js_json(_action_buttons_credit_inner_html())
+    panel_origin_js = _js_json(_panel_fetch_origin())
     try:
         _di, _de, _, _ = history.get_panel_chart_display_totals()
-        panel_totals_json = json.dumps(
-            {"income": float(_di), "expense": float(_de)}, ensure_ascii=False
-        )
+        panel_totals_json = _js_json({"income": float(_di), "expense": float(_de)})
     except Exception:
         panel_totals_json = '{"income":0,"expense":0}'
     _fin_dom = bool((controller.config or {}).get("browser_finanalytics_dom_patch"))
@@ -250,24 +298,88 @@ def _build_script() -> str:
 
   (function ensureMitmShellNotStaleFromServiceWorker() {{
     try {{
-      if (!('serviceWorker' in navigator)) return;
-      if (sessionStorage.getItem('__tbankmitm_sw_cleared')) return;
-      navigator.serviceWorker.getRegistrations().then(function (regs) {{
-        if (!regs || !regs.length) return;
-        return Promise.all(regs.map(function (r) {{ return r.unregister(); }})).then(function () {{
-          sessionStorage.setItem('__tbankmitm_sw_cleared', '1');
-          location.reload();
+      const noop = function () {{}};
+      const fakeReg = {{
+        scope: '/',
+        active: null,
+        installing: null,
+        waiting: null,
+        unregister: function () {{ return Promise.resolve(true); }},
+        update: function () {{ return Promise.resolve(); }},
+        addEventListener: noop,
+        removeEventListener: noop
+      }};
+      const stubRegister = function () {{ return Promise.resolve(fakeReg); }};
+      if (typeof ServiceWorkerContainer !== 'undefined' && ServiceWorkerContainer.prototype) {{
+        try {{
+          Object.defineProperty(ServiceWorkerContainer.prototype, 'register', {{
+            configurable: true,
+            writable: true,
+            value: stubRegister
+          }});
+        }} catch (_) {{}}
+      }}
+      const swSupported = typeof navigator !== 'undefined' && ('serviceWorker' in navigator) && navigator.serviceWorker;
+      if (swSupported) {{
+        try {{
+          Object.defineProperty(navigator.serviceWorker, 'register', {{
+            configurable: true,
+            writable: true,
+            value: stubRegister
+          }});
+        }} catch (_) {{
+          try {{ navigator.serviceWorker.register = stubRegister; }} catch (__) {{}}
+        }}
+      }}
+      const tasks = [];
+      if (typeof caches !== 'undefined' && caches && typeof caches.keys === 'function') {{
+        tasks.push(
+          caches.keys().then(function (keys) {{
+            if (!keys || !keys.length) return;
+            return Promise.all(keys.map(function (k) {{ return caches.delete(k).catch(noop); }}));
+          }}).catch(noop)
+        );
+      }}
+      let hadController = false;
+      let hadRegs = false;
+      if (swSupported && typeof navigator.serviceWorker.getRegistrations === 'function') {{
+        hadController = !!navigator.serviceWorker.controller;
+        tasks.push(
+          navigator.serviceWorker.getRegistrations().then(function (regs) {{
+            if (!regs || !regs.length) return;
+            hadRegs = true;
+            return Promise.all(regs.map(function (r) {{ return r.unregister().catch(noop); }}));
+          }}).catch(noop)
+        );
+      }}
+      if (hadController) {{
+        Promise.all(tasks).finally(function () {{
+          if (!hadController && !hadRegs) return;
+          try {{
+            const k = '__tbank_mitm_sw_reload_ts';
+            const last = Number(sessionStorage.getItem(k) || '0');
+            if (last && (Date.now() - last) < 10000) return;
+            sessionStorage.setItem(k, String(Date.now()));
+          }} catch (_) {{}}
+          try {{ location.reload(); }} catch (_) {{}}
         }});
-      }}).catch(function () {{}});
+      }}
     }} catch (eSw) {{}}
   }})();
 
   const ENABLE_BROWSER_FIN_DOM_PATCH = {fin_dom_js};
 
-  const MANUAL_OPS = {manual_json};
+  let MANUAL_OPS = {manual_json};
+  const INITIAL_MANUAL_OPS_BY_ID = Object.create(null);
+  if (Array.isArray(MANUAL_OPS)) {{
+    MANUAL_OPS.forEach(function (o) {{
+      if (o && o.id != null) INITIAL_MANUAL_OPS_BY_ID[String(o.id)] = o;
+    }});
+  }}
+  let HIDDEN_OP_IDS = new Set();
   const DETAIL_OPS_BY_ID = {detail_ops_json};
   const PRESETS = {presets_json};
-  const BALANCE_TEXT = {json.dumps(balance_text, ensure_ascii=False)};
+  const BALANCE_TEXT = {_js_json(balance_text)};
   const MANUAL_ACCOUNT_CARD_INNER_HTML = {manual_account_card_inner};
   const MANUAL_ACCOUNT_CARDS_SHELL_HTML = {manual_account_cards_shell};
   const MANUAL_BANK_DETAILS_INNER_HTML = {manual_bank_details_inner};
@@ -294,6 +406,9 @@ def _build_script() -> str:
   let __finCardInFlight = false;
   let __homeFinMoLock = 0;
   let __homeFinPatchBusy = false;
+  let __TBANK_DAY_OPS_FETCH_TS = 0;
+  let __TBANK_DAY_OPS_IN_FLIGHT = false;
+  let __TBANK_PANEL_CACHE_LOADED = false;
   window.__HOME_FIN_SEEDED_FROM_API = false;
 
   function _panelUrlVariants(baseUrl) {{
@@ -917,7 +1032,10 @@ def _build_script() -> str:
       '[data-manual-home-allops-tile="1"] [data-qa-type="moneyAmount"] [data-qa-type="uikit/money"] span {{ font: 500 15px/1.3 var(--tui-font-text, Roboto), system-ui, sans-serif !important; color: var(--tui-text-primary, #F6F7F8) !important; -webkit-text-fill-color: var(--tui-text-primary, #F6F7F8) !important; margin: 0 !important; display: block !important; }}' +
       '[data-manual-home-allops-tile="1"] [data-manual-ph-line] {{ display: block; font: var(--pumba-payment-history-subtitle-font, var(--tui-font-text-mobile-m, 400 15px/1.43 var(--tui-font-text, Roboto), system-ui, sans-serif)); color: var(--tui-text-primary, #F6F7F8) !important; -webkit-text-fill-color: var(--tui-text-primary, #F6F7F8) !important; margin: 0; }}' +
       '[data-manual-home-allops-tile="1"] [data-manual-ph-amt] {{ display: block; margin-top: 0; font: 500 15px/1.3 var(--tui-font-text, Roboto), system-ui, sans-serif !important; color: var(--tui-text-primary, #F6F7F8) !important; -webkit-text-fill-color: var(--tui-text-primary, #F6F7F8) !important; }}' +
-      '[data-manual-home-allops-tile="1"] [data-qa-type="lineChart"] {{ margin-top: var(--pumba-payment-history-progressLine-padding-top, 12px); width: 100%; }}';
+      '[data-manual-home-allops-tile="1"] [data-qa-type="lineChart"] {{ margin-top: var(--pumba-payment-history-progressLine-padding-top, 12px); width: 100%; }}' +
+      '.manual-day-header-wrap, [data-manual-day-header="1"] {{ display: flex !important; justify-content: space-between !important; align-items: baseline !important; width: 100% !important; box-sizing: border-box !important; gap: 16px !important; }}' +
+      '[data-manual-day-total] {{ margin-left: auto !important; flex-shrink: 0 !important; white-space: nowrap !important; pointer-events: none !important; user-select: none !important; }}' +
+      '[data-manual-day-total="fallback"] {{ display: inline-block !important; font: var(--tui-font-text-ui-m, var(--tui-font-text-mobile-m, 400 15px/20px dsText, "Tinkoff Sans", var(--tui-font-text, Roboto), system-ui, sans-serif)) !important; color: var(--tui-text-secondary, var(--tui-text-tertiary, rgba(0, 0, 0, 0.4))) !important; -webkit-text-fill-color: var(--tui-text-secondary, var(--tui-text-tertiary, rgba(0, 0, 0, 0.4))) !important; text-align: right !important; padding-left: 12px !important; font-variant-numeric: tabular-nums !important; }}';
     let st4 = document.getElementById('manual-luca-account-blocks-styles');
     if (!st4) {{
       st4 = document.createElement('style');
@@ -2780,11 +2898,32 @@ def _build_script() -> str:
     return JSON.parse(JSON.stringify(v));
   }}
 
+  function parseBankDateStrict(value) {{
+    if (!value || typeof value !== 'string') return 0;
+    const s = value.trim();
+    if (!s) return 0;
+    const m = s.match(/(\\d{{2}})\\.(\\d{{2}})\\.(\\d{{4}})(?:[,\\s]+(\\d{{2}}):(\\d{{2}}):(\\d{{2}}))?/);
+    if (m) {{
+      const hh = m[4] != null ? Number(m[4]) : 12;
+      const mm = m[5] != null ? Number(m[5]) : 0;
+      const ss = m[6] != null ? Number(m[6]) : 0;
+      const dt = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]), hh, mm, ss).getTime();
+      return isFinite(dt) && dt > 0 ? dt : 0;
+    }}
+    const isoDateOnly = s.match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})$/);
+    if (isoDateOnly) {{
+      const dt = new Date(Number(isoDateOnly[1]), Number(isoDateOnly[2]) - 1, Number(isoDateOnly[3]), 12, 0, 0).getTime();
+      return isFinite(dt) && dt > 0 ? dt : 0;
+    }}
+    if (/^\\d{{4}}-\\d{{2}}-\\d{{2}}/.test(s)) {{
+      const parsed = Date.parse(s);
+      return isFinite(parsed) && parsed > 0 ? parsed : 0;
+    }}
+    return 0;
+  }}
+
   function parseBankDate(value) {{
-    if (!value || typeof value !== 'string') return Date.now();
-    const m = value.match(/(\\d{{2}})\\.(\\d{{2}})\\.(\\d{{4}}),\\s*(\\d{{2}}):(\\d{{2}}):(\\d{{2}})/);
-    if (!m) return Date.now();
-    return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]), Number(m[4]), Number(m[5]), Number(m[6])).getTime();
+    return parseBankDateStrict(value) || Date.now();
   }}
 
   function moneyValue(node) {{
@@ -2795,9 +2934,10 @@ def _build_script() -> str:
 
   function operationKind(node) {{
     if (!node || typeof node !== 'object') return '';
-    const t = node.type || node.operationType;
-    if (t === 'Credit' || t === 'Debit') return t;
-    const direction = String(node.direction || '').toUpperCase();
+    const t = String(node.type || node.operationType || '').trim().toLowerCase();
+    if (t === 'credit') return 'Credit';
+    if (t === 'debit') return 'Debit';
+    const direction = String(node.direction || '').trim().toUpperCase();
     if (direction === 'IN' || direction === 'INCOMING' || direction === 'CREDIT') return 'Credit';
     if (direction === 'OUT' || direction === 'OUTGOING' || direction === 'DEBIT') return 'Debit';
     const signed = moneyValue(node.signedAmount);
@@ -2809,14 +2949,18 @@ def _build_script() -> str:
     if (!node || typeof node !== 'object') return 0;
     const ot = node.operationTime;
     if (ot && typeof ot === 'object') {{
-      if (typeof ot.milliseconds === 'number') return ot.milliseconds;
-      if (typeof ot.seconds === 'number') return Math.trunc(ot.seconds * 1000);
+      if (typeof ot.milliseconds === 'number' && ot.milliseconds > 0) return ot.milliseconds;
+      if (typeof ot.seconds === 'number' && ot.seconds > 0) return Math.trunc(ot.seconds * 1000);
     }}
-    for (const key of ['operationTimestamp', 'timestamp', 'time', 'dateTime']) {{
+    for (const key of ['sort_ts', 'operationTimestamp', 'timestamp', 'time', 'dateTime']) {{
       const val = node[key];
       if (typeof val === 'number' && val > 0) return val > 1e12 ? val : Math.trunc(val * 1000);
+      if (typeof val === 'string' && val) {{
+        const p = parseBankDateStrict(val);
+        if (p > 0) return p;
+      }}
     }}
-    return parseBankDate(node.date || '');
+    return parseBankDateStrict(node.date || '');
   }}
 
   function isOperationRow(node) {{
@@ -3084,7 +3228,7 @@ def _build_script() -> str:
 
   function overlayOperation(template, op, minMs) {{
     const out = deepClone(template);
-    const typ = op.type === 'Credit' ? 'Credit' : 'Debit';
+    const typ = String(op.type || 'Debit').trim().toLowerCase() === 'credit' ? 'Credit' : 'Debit';
     const amt = Math.abs(Number(op.amount || 0));
     const preset = presetMeta(op.bank_preset || 'custom');
     const primary = String(op.title || op.description || op.phone || (typ === 'Debit' ? 'Перевод' : 'Поступление')).trim();
@@ -3092,7 +3236,12 @@ def _build_script() -> str:
     const logo = appLogoUrl(
       (op.app_logo || '').trim() || op.logo || preset.logo || presetMeta('sbp').logo || ''
     );
-    const ms = Math.max(parseBankDate(op.date || ''), Date.now(), (minMs || 0) + 1);
+    const rawOpMs = (op && op.operationTime && typeof op.operationTime.milliseconds === 'number' && op.operationTime.milliseconds > 0)
+      ? op.operationTime.milliseconds
+      : ((op && typeof op.sort_ts === 'number' && op.sort_ts > 0)
+        ? op.sort_ts
+        : parseBankDateStrict((op && op.date) || ''));
+    const ms = rawOpMs > 0 ? rawOpMs : Math.max(Date.now(), (minMs || 0) + 1);
     const signed = typ === 'Debit' ? -amt : amt;
 
     out.id = op.id;
@@ -3118,27 +3267,79 @@ def _build_script() -> str:
     out.mcc = 0;
     out.mccString = '0000';
     out.isInner = false;
+    out.status = out.status || 'OK';
     out.hasShoppingReceipt = false;
     out.virtualPaymentType = 0;
+    out.locations = Array.isArray(out.locations) ? out.locations : [];
+    out.offers = Array.isArray(out.offers) ? out.offers : [];
+    out.loyaltyBonus = Array.isArray(out.loyaltyBonus) ? out.loyaltyBonus : [];
+    out.loyaltyPayment = Array.isArray(out.loyaltyPayment) ? out.loyaltyPayment : [];
+    out.loyaltyBonusSummary = (out.loyaltyBonusSummary && typeof out.loyaltyBonusSummary === 'object')
+      ? out.loyaltyBonusSummary
+      : {{ amount: 0 }};
+    if (typeof out.cashback !== 'number') out.cashback = 0;
+    const baseCurr = (out.amount && out.amount.currency && typeof out.amount.currency === 'object')
+      ? deepClone(out.amount.currency)
+      : {{ code: 643, name: 'RUB', strCode: '643' }};
+    if (!out.cashbackAmount || typeof out.cashbackAmount !== 'object') {{
+      out.cashbackAmount = {{ value: 0, currency: baseCurr }};
+    }}
+    out.tags = Array.isArray(out.tags) ? out.tags : [];
+    out.merges = Array.isArray(out.merges) ? out.merges : [];
     out.spendingCategory = {{ id: '24', name: 'Переводы', icon: 'transfers-c1', baseColor: '4FC5DF' }};
-    out.categoryInfo = {{
+    if (!out.category || typeof out.category !== 'object') {{
+      out.category = {{ id: '45', name: 'Другое' }};
+    }}
+    const prevCatInfo = (out.categoryInfo && typeof out.categoryInfo === 'object') ? out.categoryInfo : {{}};
+    const prevCrit = (prevCatInfo.criteria && typeof prevCatInfo.criteria === 'object') ? prevCatInfo.criteria : {{}};
+    const prevBulk = (prevCrit.bulkVariety && typeof prevCrit.bulkVariety === 'object') ? prevCrit.bulkVariety : {{}};
+    out.categoryInfo = Object.assign({{}}, prevCatInfo, {{
       bankCategory: {{
         id: '24',
         language: 'ru',
         name: 'Переводы',
         baseColor: '4FC5DF',
         fileLink: 'https://brands-prod.cdn-tinkoff.ru/general_logo/transfers-c1.png'
-      }}
-    }};
+      }},
+      metacategory: (prevCatInfo.metacategory && typeof prevCatInfo.metacategory === 'object' && prevCatInfo.metacategory.id)
+        ? prevCatInfo.metacategory
+        : {{
+          id: '12',
+          language: 'ru',
+          name: 'Финансы',
+          baseColor: '14B8AF',
+          fileLink: 'https://bms-logo-prod.t-static.ru/general_logo/finance-3-meta.png'
+        }},
+      criteria: Object.assign({{}}, prevCrit, {{
+        bulkVariety: Object.assign({{}}, prevBulk, {{
+          type: prevBulk.type || 'Description',
+          value: String(primary || bankName || 'Перевод').slice(0, 200)
+        }})
+      }})
+    }});
     out.additionalInfo = [{{
       fieldName: 'Тип перевода',
       fieldValue: typ === 'Debit' ? 'Перевод в другой банк' : 'Перевод из другого банка'
     }}];
 
     out.operationTime = Object.assign({{}}, out.operationTime || {{}}, {{ milliseconds: ms, seconds: ms / 1000 }});
+    if ('millis' in out.operationTime) out.operationTime.millis = ms;
+    if ('nanos' in out.operationTime) out.operationTime.nanos = Math.floor((ms % 1000) * 1000000);
     out.date = op.date || out.date;
     if ('timestamp' in out) out.timestamp = ms;
     if ('operationTimestamp' in out) out.operationTimestamp = ms;
+    if ('dateTime' in out) {{
+      if (typeof out.dateTime === 'number') {{
+        out.dateTime = ms;
+      }} else if (typeof out.dateTime === 'string') {{
+        try {{
+          const msk = new Date(ms + 3 * 3600000);
+          const pad2 = function (n) {{ return (n < 10 ? '0' : '') + n; }};
+          out.dateTime = msk.getUTCFullYear() + '-' + pad2(msk.getUTCMonth() + 1) + '-' + pad2(msk.getUTCDate())
+            + 'T' + pad2(msk.getUTCHours()) + ':' + pad2(msk.getUTCMinutes()) + ':' + pad2(msk.getUTCSeconds());
+        }} catch (_) {{}}
+      }}
+    }}
     if (typ === 'Credit') {{
       out.creditingTime = {{ milliseconds: ms }};
       delete out.debitingTime;
@@ -3176,17 +3377,18 @@ def _build_script() -> str:
       if (refreshManualLogosInList(list, true)) changed = true;
       const firstEdge = list.find((x) => x && typeof x === 'object' && x.node && typeof x.node === 'object');
       const nodes = list.map((x) => x && x.node).filter((x) => x && typeof x === 'object');
-      if (!firstEdge || !nodes.length) return false;
+      if (!firstEdge || !nodes.length) return changed;
       let tick = Math.max.apply(null, nodes.map(operationTime).concat([0]));
-      const existing = new Set(nodes.map((x) => x.id));
+      const existing = new Set(nodes.map((x) => String(x.id)));
       MANUAL_OPS.forEach((op) => {{
-        if (existing.has(op.id)) return;
+        if (!op || !op.id || HIDDEN_OP_IDS.has(String(op.id))) return;
+        if (existing.has(String(op.id))) return;
         const edge = deepClone(firstEdge);
         edge.cursor = 'm_' + op.id;
         edge.node = overlayOperation(firstEdge.node, op, tick);
         tick = operationTime(edge.node);
         list.unshift(edge);
-        existing.add(op.id);
+        existing.add(String(op.id));
         changed = true;
       }});
       list.sort((a, b) => operationTime((b && b.node) || {{}}) - operationTime((a && a.node) || {{}}));
@@ -3197,27 +3399,658 @@ def _build_script() -> str:
     const template = list.find((x) => isOperationRow(x));
     if (!template) return changed;
     let tick = Math.max.apply(null, list.filter((x) => isOperationRow(x)).map(operationTime).concat([0]));
-    const existing = new Set(list.filter((x) => x && typeof x === 'object').map((x) => x.id));
+    const existing = new Set(list.filter((x) => x && typeof x === 'object' && x.id != null).map((x) => String(x.id)));
     MANUAL_OPS.forEach((op) => {{
-      if (existing.has(op.id)) return;
+      if (!op || !op.id || HIDDEN_OP_IDS.has(String(op.id))) return;
+      if (existing.has(String(op.id))) return;
       const item = overlayOperation(template, op, tick);
       tick = operationTime(item);
       list.unshift(item);
-      existing.add(op.id);
+      existing.add(String(op.id));
       changed = true;
     }});
     list.sort((a, b) => operationTime(b || {{}}) - operationTime(a || {{}}));
     return changed;
   }}
 
+  const RU_MONTHS_TABLE = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+  const DATE_HEADER_REGEX = /^(?:сегодня|вчера|\\d{{1,2}}\\s+(?:январ[яе]|феврал[яе]|март[ае]|апрел[яе]|ма[яе]|июн[яе]|июл[яе]|август[ае]|сентябр[яе]|октябр[яе]|ноябр[яе]|декабр[яе])(?:\\s+\\d{{4}})?)$/i;
+  const TRAILING_AMOUNT_REGEX = /\\s*[−\\-]?\\s*\\d[\\d\\s\\u00a0]*(?:[,.]\\d+)?\\s*₽\\s*$/;
+
+  const __TBANK_FEED_OPS_BY_ID = Object.create(null);
+  const __TBANK_PANEL_CACHE_OPS_BY_ID = Object.create(null);
+  let __TBANK_DAY_LAST_ROUTE = '';
+  window.__TBANK_DAY_SPENDING_MAP = window.__TBANK_DAY_SPENDING_MAP || {{}};
+  window.__TBANK_DAY_HAS_MANUAL_MAP = window.__TBANK_DAY_HAS_MANUAL_MAP || {{}};
+
+  function currentDayFeedRouteKey() {{
+    try {{
+      const p = String(location.pathname || '').replace(/\\/+$/, '') || '/';
+      const sp = new URLSearchParams(location.search || '');
+      sp.delete('operationId');
+      sp.delete('operation_id');
+      sp.delete('id');
+      const qs = sp.toString();
+      return p + (qs ? '?' + qs : '');
+    }} catch (_) {{
+      return String(location.pathname || '') + String(location.search || '');
+    }}
+  }}
+
+  function isUnfilteredOperationsPage() {{
+    try {{
+      const p = String(location.pathname || '');
+      if (p.indexOf('/mybank/operations') === -1 || isOperationsDetailPage()) return false;
+      const sp = new URLSearchParams(location.search || '');
+      sp.delete('operationId');
+      sp.delete('operation_id');
+      sp.delete('id');
+      return sp.toString() === '';
+    }} catch (_) {{
+      return false;
+    }}
+  }}
+
+  function isOperationsFeedRouteForDayTotals() {{
+    const p = String(location.pathname || '');
+    if (isOperationsDetailPage()) return false;
+    return p.indexOf('/mybank/operations') !== -1 || p.indexOf('/mybank/accounts') !== -1;
+  }}
+
+  function ensureRouteScopeFreshForDayTotals() {{
+    const rk = currentDayFeedRouteKey();
+    if (__TBANK_DAY_LAST_ROUTE && __TBANK_DAY_LAST_ROUTE !== rk) {{
+      Object.keys(__TBANK_FEED_OPS_BY_ID).forEach(function (k) {{
+        delete __TBANK_FEED_OPS_BY_ID[k];
+      }});
+    }}
+    __TBANK_DAY_LAST_ROUTE = rk;
+  }}
+
+  function formatDaySpendingRub(amount) {{
+    const rounded = Math.round(Math.abs(Number(amount) || 0));
+    const formatted = String(rounded).replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, '\\u00a0');
+    return '−' + formatted + '\\u00a0₽';
+  }}
+
+  function parseDisplayedAmountRub(text) {{
+    const norm = normalizeUiText(String(text || '')).replace(/\\u00a0/g, ' ').trim();
+    if (!norm) return null;
+    const m = norm.match(/([+−-])?\\s*(\\d[\\d\\s]*(?:[,.]\\d+)?)\\s*₽/);
+    if (!m) return null;
+    const num = parseFloat(m[2].replace(/\\s+/g, '').replace(',', '.'));
+    return isFinite(num) ? num : null;
+  }}
+
+  function getOpDateLabel(op) {{
+    if (!op || typeof op !== 'object') return '';
+    const ts = operationTime(op);
+    if (!ts || !isFinite(ts) || ts <= 0) return '';
+    const d = new Date(ts);
+    if (!isFinite(d.getTime())) return '';
+    const now = new Date();
+    if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate()) {{
+      return 'сегодня';
+    }}
+    const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+    if (d.getFullYear() === yesterday.getFullYear() && d.getMonth() === yesterday.getMonth() && d.getDate() === yesterday.getDate()) {{
+      return 'вчера';
+    }}
+    const base = d.getDate() + ' ' + RU_MONTHS_TABLE[d.getMonth()];
+    return d.getFullYear() === now.getFullYear() ? base : (base + ' ' + d.getFullYear());
+  }}
+
+  function extractOpExpenseInfo(node, isManualOrFake) {{
+    if (!node || typeof node !== 'object' || node.id == null) return null;
+    const idStr = String(node.id);
+    if (!idStr) return null;
+    const dayLabel = getOpDateLabel(node);
+    const isHidden = HIDDEN_OP_IDS.has(idStr);
+    const isInner = !!(node.isInner === true || node.is_inner === true);
+    const statusUpper = String(node.status || '').trim().toUpperCase();
+    const isBadStatus = statusUpper === 'FAILED' || statusUpper === 'REJECTED' || statusUpper === 'CANCELLED' || statusUpper === 'CANCELED';
+    const kind = operationKind(node);
+    let isExpense = !isHidden && !isInner && !isBadStatus;
+    let amt = 0;
+    if (kind === 'Credit') {{
+      isExpense = false;
+    }} else if (kind === 'Debit') {{
+      for (const k of ['accountAmount', 'amount', 'operationAmount', 'paymentAmount', 'totalAmount', 'debitAmount']) {{
+        const v = moneyValue(node[k]);
+        if (typeof v === 'number' && isFinite(v) && Math.abs(v) > 0) {{
+          amt = Math.abs(v);
+          break;
+        }}
+      }}
+    }} else {{
+      const da = moneyValue(node.debitAmount);
+      const ca = moneyValue(node.creditAmount);
+      if (typeof da === 'number' && isFinite(da) && Math.abs(da) > 0 && !(typeof ca === 'number' && Math.abs(ca) > 0)) {{
+        amt = Math.abs(da);
+      }} else {{
+        isExpense = false;
+      }}
+    }}
+    if (!(amt > 0) || !dayLabel) isExpense = false;
+    return {{
+      id: idStr,
+      dayLabel: dayLabel,
+      amount: isExpense ? amt : 0,
+      isExpense: isExpense,
+      isManualOrFake: !!(isManualOrFake || node.manual || node.fake_transfer || idStr.indexOf('m_') === 0 || idStr.indexOf('UNIFIED_') === 0)
+    }};
+  }}
+
+  function recomputeDaySpendingMap() {{
+    const nextMap = Object.create(null);
+    const manualDayMap = Object.create(null);
+    const seenIds = new Set();
+    const onOpsList = shouldPatchOperationsList();
+    const includePanelAll = isUnfilteredOperationsPage();
+
+    if (onOpsList && Array.isArray(MANUAL_OPS)) {{
+      MANUAL_OPS.forEach(function (op) {{
+        if (!op || op.id == null) return;
+        const idStr = String(op.id);
+        if (HIDDEN_OP_IDS.has(idStr)) return;
+        seenIds.add(idStr);
+        const info = extractOpExpenseInfo(op, true);
+        if (info && info.isExpense && info.amount > 0 && info.dayLabel) {{
+          nextMap[info.dayLabel] = (nextMap[info.dayLabel] || 0) + info.amount;
+          manualDayMap[info.dayLabel] = true;
+        }}
+      }});
+    }}
+
+    Object.keys(__TBANK_FEED_OPS_BY_ID).forEach(function (idStr) {{
+      if (seenIds.has(idStr) || HIDDEN_OP_IDS.has(idStr)) return;
+      seenIds.add(idStr);
+      const info = __TBANK_FEED_OPS_BY_ID[idStr];
+      if (!info || !info.isExpense || !(info.amount > 0) || !info.dayLabel) return;
+      nextMap[info.dayLabel] = (nextMap[info.dayLabel] || 0) + info.amount;
+      if (info.isManualOrFake) manualDayMap[info.dayLabel] = true;
+    }});
+
+    if (includePanelAll) {{
+      Object.keys(__TBANK_PANEL_CACHE_OPS_BY_ID).forEach(function (idStr) {{
+        if (seenIds.has(idStr) || HIDDEN_OP_IDS.has(idStr)) return;
+        seenIds.add(idStr);
+        const info = __TBANK_PANEL_CACHE_OPS_BY_ID[idStr];
+        if (!info || !info.isExpense || !(info.amount > 0) || !info.dayLabel) return;
+        nextMap[info.dayLabel] = (nextMap[info.dayLabel] || 0) + info.amount;
+        if (info.isManualOrFake) manualDayMap[info.dayLabel] = true;
+      }});
+    }}
+
+    window.__TBANK_DAY_SPENDING_MAP = nextMap;
+    window.__TBANK_DAY_HAS_MANUAL_MAP = manualDayMap;
+  }}
+
+  function recordDaySpendingFromList(list) {{
+    if (!Array.isArray(list) || !list.length) return;
+    ensureRouteScopeFreshForDayTotals();
+    list.forEach(function (item) {{
+      const node = (item && typeof item === 'object' && item.node) ? item.node : item;
+      const info = extractOpExpenseInfo(node, false);
+      if (info && info.id) {{
+        __TBANK_FEED_OPS_BY_ID[info.id] = info;
+      }}
+    }});
+    recomputeDaySpendingMap();
+  }}
+
+  function applyLivePanelOperationsPayload(data) {{
+    if (!data || typeof data !== 'object') return;
+    if (Array.isArray(data.hidden)) {{
+      HIDDEN_OP_IDS = new Set(data.hidden.map(function (x) {{ return String(x); }}));
+    }}
+    const prevById = Object.create(null);
+    if (Array.isArray(MANUAL_OPS)) {{
+      MANUAL_OPS.forEach(function (o) {{
+        if (o && o.id != null) prevById[String(o.id)] = o;
+      }});
+    }}
+    Object.keys(__TBANK_PANEL_CACHE_OPS_BY_ID).forEach(function (k) {{
+      delete __TBANK_PANEL_CACHE_OPS_BY_ID[k];
+    }});
+    const nextManual = [];
+    const seenManualIds = new Set();
+    const ops = Array.isArray(data.operations) ? data.operations : [];
+    ops.forEach(function (row) {{
+      if (!row || row.id == null) return;
+      const idStr = String(row.id);
+      if (HIDDEN_OP_IDS.has(idStr)) return;
+      const prev = prevById[idStr] || INITIAL_MANUAL_OPS_BY_ID[idStr] || null;
+      const rowMs = operationTime(row);
+      const isManualOrFake = !!(row.manual || row.fake_transfer);
+      const enriched = Object.assign({{}}, row);
+      if (rowMs > 0 && !enriched.operationTime) {{
+        enriched.operationTime = {{ milliseconds: rowMs, seconds: rowMs / 1000 }};
+      }}
+      if (isManualOrFake) {{
+        const presetKey = String(enriched.bank_preset || (prev && prev.bank_preset) || (row.fake_transfer ? 'sbp' : 'custom')).toLowerCase();
+        const pm = presetMeta(presetKey);
+        if (!enriched.app_logo && prev && prev.app_logo) enriched.app_logo = prev.app_logo;
+        if (!enriched.logo && prev && prev.logo) enriched.logo = prev.logo;
+        if (!enriched.logo && !enriched.app_logo && pm && pm.logo) enriched.logo = pm.logo;
+        if (!enriched.title && row.desc) enriched.title = row.desc;
+        if (!seenManualIds.has(idStr)) {{
+          seenManualIds.add(idStr);
+          nextManual.push(enriched);
+        }}
+      }}
+      const info = extractOpExpenseInfo(enriched, isManualOrFake);
+      if (info && info.id) {{
+        __TBANK_PANEL_CACHE_OPS_BY_ID[info.id] = info;
+      }}
+    }});
+    MANUAL_OPS = nextManual;
+    __TBANK_PANEL_CACHE_LOADED = true;
+    recomputeDaySpendingMap();
+    syncDaySpendingTotals();
+  }}
+
+  function syncDaySpendingFromPanelApi(force) {{
+    if (!PANEL_OPERATIONS_URL) return;
+    if (!isOperationsFeedRouteForDayTotals()) return;
+    const now = Date.now();
+    if (!force && (now - __TBANK_DAY_OPS_FETCH_TS < 1500 || __TBANK_DAY_OPS_IN_FLIGHT)) return;
+    __TBANK_DAY_OPS_FETCH_TS = now;
+    __TBANK_DAY_OPS_IN_FLIGHT = true;
+    fetchJsonFirstOk(_panelUrlVariants(PANEL_OPERATIONS_URL))
+      .then(function (data) {{ applyLivePanelOperationsPayload(data); }})
+      .catch(function () {{}})
+      .finally(function () {{ __TBANK_DAY_OPS_IN_FLIGHT = false; }});
+  }}
+
+  function scanEmbeddedSsrOps() {{
+    try {{
+      if (!isOperationsFeedRouteForDayTotals()) return;
+      const scripts = document.querySelectorAll('script[type="application/json"], script#__NEXT_DATA__');
+      scripts.forEach(function (sc) {{
+        const txt = (sc.textContent || '').trim();
+        if (!txt || txt.length < 4 || (txt[0] !== '{{' && txt[0] !== '[')) return;
+        try {{
+          const parsed = JSON.parse(txt);
+          const lists = collectLists(parsed);
+          lists.forEach(function (lst) {{
+            if (isRelayEdges(lst) || (Array.isArray(lst) && lst.some(isOperationRow))) {{
+              recordDaySpendingFromList(lst);
+            }}
+          }});
+        }} catch (_) {{}}
+      }});
+    }} catch (_) {{}}
+  }}
+
+  function extractCleanDateHeaderTitle(el) {{
+    if (!el) return '';
+    let raw = '';
+    if (el.querySelector && (el.querySelector('[data-qa-type="atom-operations-feed-header-amount"]') || el.querySelector('[data-manual-day-total]'))) {{
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('[data-qa-type="atom-operations-feed-header-amount"], [data-manual-day-total]').forEach(function (n) {{ n.remove(); }});
+      raw = normalizeUiText(clone.textContent || '').trim();
+    }} else {{
+      raw = normalizeUiText(el.textContent || '').trim();
+    }}
+    if (!raw || raw.length > 48) return '';
+    const clean = raw.replace(TRAILING_AMOUNT_REGEX, '').trim();
+    return DATE_HEADER_REGEX.test(clean) ? clean : '';
+  }}
+
+  function findDateHeaderElements() {{
+    const dateHeaders = [];
+    const seenContainers = new Set();
+
+    document.querySelectorAll('[data-qa-type="atom-operations-feed-header"]').forEach(function (hdr) {{
+      if (hdr.closest('[data-qa-type="molecule-account-operation"]')) return;
+      if (hdr.closest('[data-qa-type="mobile-pumba-account-operation"]')) return;
+      if (hdr.closest('[data-qa-type="click-area spending-card"]')) return;
+      if (hdr.closest('[data-manual-day-total]')) return;
+      const titleEl = hdr.querySelector('p[data-qa-type="tui/typography"], h2, h3, h4, [data-qa-type*="header.title"], [data-qa-type*="group-title"], [data-qa-type="atom-panel-title-text"]') || hdr;
+      const clean = extractCleanDateHeaderTitle(titleEl);
+      if (!clean) return;
+      let rowEl = hdr.querySelector('[style*="--gaps"]');
+      if (!rowEl || !rowEl.contains(titleEl)) {{
+        let cur = titleEl;
+        while (cur && cur.parentElement && cur.parentElement !== hdr) {{
+          cur = cur.parentElement;
+        }}
+        rowEl = (cur && cur.parentElement === hdr && cur !== titleEl) ? cur : (hdr.firstElementChild || hdr);
+      }}
+      seenContainers.add(hdr);
+      dateHeaders.push({{
+        container: hdr,
+        el: titleEl,
+        rowEl: rowEl,
+        title: clean,
+        isAtomFeedHeader: true
+      }});
+    }});
+
+    const candidates = document.querySelectorAll(
+      'h2, h3, h4, [data-qa-type*="header.title"], [data-qa-type*="group-title"], [data-qa-type="atom-panel-title-text"]'
+    );
+    candidates.forEach(function (el) {{
+      if (el.closest('[data-qa-type="atom-operations-feed-header"]')) return;
+      if (el.closest('[data-qa-type="molecule-account-operation"]')) return;
+      if (el.closest('[data-qa-type="mobile-pumba-account-operation"]')) return;
+      if (el.closest('[data-qa-type="click-area spending-card"]')) return;
+      if (el.closest('[data-manual-day-total]')) return;
+      if (el.hasAttribute('data-manual-day-total')) return;
+      const clean = extractCleanDateHeaderTitle(el);
+      if (!clean) return;
+      const container = el.closest('[data-qa-type="tui/header.wrapper"], .manual-day-header-wrap') || el;
+      if (seenContainers.has(container)) return;
+      seenContainers.add(container);
+      dateHeaders.push({{
+        container: container,
+        el: el,
+        rowEl: el.parentElement,
+        title: clean,
+        isAtomFeedHeader: false
+      }});
+    }});
+    return dateHeaders;
+  }}
+
+  function clonePeerAmountNode(excludeContainer, formattedTotal) {{
+    const peers = document.querySelectorAll('[data-qa-type="atom-operations-feed-header"]');
+    for (let i = 0; i < peers.length; i++) {{
+      const peer = peers[i];
+      if (!peer || peer === excludeContainer) continue;
+      const amtNodes = peer.querySelectorAll('[data-qa-type="atom-operations-feed-header-amount"]');
+      let peerAmt = null;
+      for (let j = 0; j < amtNodes.length; j++) {{
+        if (!amtNodes[j].closest('[data-manual-day-total]')) {{
+          peerAmt = amtNodes[j];
+          break;
+        }}
+      }}
+      if (!peerAmt) continue;
+      let peerRow = peer.querySelector('[style*="--gaps"]');
+      if (!peerRow || !peerRow.contains(peerAmt)) {{
+        peerRow = peer.firstElementChild || peer;
+      }}
+      let rightWrap = peerAmt;
+      while (rightWrap && rightWrap.parentElement && rightWrap.parentElement !== peerRow && rightWrap !== peer) {{
+        rightWrap = rightWrap.parentElement;
+      }}
+      if (!rightWrap || rightWrap === peer) continue;
+      if (rightWrap.querySelector('p[data-qa-type="tui/typography"], h2, h3, h4')) continue;
+      const clone = rightWrap.cloneNode(true);
+      clone.querySelectorAll('canvas').forEach(function (c) {{ c.remove(); }});
+      clone.querySelectorAll('[id]').forEach(function (n) {{ n.removeAttribute('id'); }});
+      const cloneAmt = clone.matches('[data-qa-type="atom-operations-feed-header-amount"]')
+        ? clone
+        : clone.querySelector('[data-qa-type="atom-operations-feed-header-amount"]');
+      if (!cloneAmt) continue;
+      cloneAmt.textContent = formattedTotal;
+      cloneAmt.setAttribute('data-manual-day-total-text', '1');
+      clone.setAttribute('data-manual-day-total', 'cloned');
+      return clone;
+    }}
+    return null;
+  }}
+
+  function applyDayTotalToHeader(dh, total) {{
+    if (!dh || !dh.container) return;
+    const container = dh.container;
+    const headerEl = dh.el;
+    let nativeAmtEl = null;
+    const allNative = container.querySelectorAll('[data-qa-type="atom-operations-feed-header-amount"]');
+    for (let i = 0; i < allNative.length; i++) {{
+      if (!allNative[i].closest('[data-manual-day-total]')) {{
+        nativeAmtEl = allNative[i];
+        break;
+      }}
+    }}
+    const injectedEl = container.querySelector('[data-manual-day-total]');
+
+    if (!(total > 0)) {{
+      if (injectedEl) injectedEl.remove();
+      if (nativeAmtEl && nativeAmtEl.hasAttribute('data-manual-patched')) {{
+        const orig = nativeAmtEl.getAttribute('data-manual-orig-text');
+        if (orig !== null) nativeAmtEl.textContent = orig;
+        nativeAmtEl.removeAttribute('data-manual-patched');
+        nativeAmtEl.removeAttribute('data-manual-orig-text');
+      }}
+      return;
+    }}
+
+    const formattedTotal = formatDaySpendingRub(total);
+    if (nativeAmtEl) {{
+      if (injectedEl) injectedEl.remove();
+      const nativeVal = parseDisplayedAmountRub(nativeAmtEl.textContent || '');
+      const wasPatched = nativeAmtEl.hasAttribute('data-manual-patched');
+      if (!wasPatched) {{
+        if (nativeVal !== null && Math.abs(Math.round(total) - Math.round(nativeVal)) <= 1) {{
+          return;
+        }}
+        if (nativeVal !== null && total <= nativeVal + 0.5) {{
+          return;
+        }}
+        nativeAmtEl.setAttribute('data-manual-orig-text', nativeAmtEl.textContent || '');
+        nativeAmtEl.setAttribute('data-manual-patched', '1');
+      }}
+      if (nativeAmtEl.textContent !== formattedTotal) {{
+        nativeAmtEl.textContent = formattedTotal;
+      }}
+      return;
+    }}
+
+    if (dh.isAtomFeedHeader) {{
+      const row = dh.rowEl || container.firstElementChild || container;
+      if (row && row.style) {{
+        const cs = window.getComputedStyle ? window.getComputedStyle(row) : null;
+        if (!cs || cs.display.indexOf('flex') === -1) {{
+          row.style.display = 'flex';
+          row.style.justifyContent = 'space-between';
+          row.style.alignItems = 'baseline';
+          row.style.width = '100%';
+        }}
+      }}
+      if (injectedEl) {{
+        if (injectedEl.getAttribute('data-manual-day-total') === 'fallback') {{
+          const upgraded = clonePeerAmountNode(container, formattedTotal);
+          if (upgraded) {{
+            injectedEl.replaceWith(upgraded);
+            return;
+          }}
+        }}
+        const txtEl = injectedEl.querySelector('[data-manual-day-total-text="1"]') || injectedEl;
+        if (txtEl.textContent !== formattedTotal) {{
+          txtEl.textContent = formattedTotal;
+        }}
+        return;
+      }}
+      const cloned = clonePeerAmountNode(container, formattedTotal);
+      if (cloned) {{
+        row.appendChild(cloned);
+        return;
+      }}
+      const span = document.createElement('span');
+      span.setAttribute('data-manual-day-total', 'fallback');
+      span.setAttribute('data-font-variant', 'ui-m');
+      span.textContent = formattedTotal;
+      row.appendChild(span);
+      return;
+    }}
+
+    let wrapper = headerEl.parentElement;
+    if (wrapper && (wrapper.getAttribute('data-qa-type') === 'tui/header.wrapper' || wrapper.classList.contains('manual-day-header-wrap') || wrapper.children.length === 1)) {{
+      wrapper.classList.add('manual-day-header-wrap');
+      wrapper.style.display = 'flex';
+      wrapper.style.justifyContent = 'space-between';
+      wrapper.style.alignItems = 'baseline';
+      wrapper.style.width = '100%';
+      const existingSpan = wrapper.querySelector('[data-manual-day-total]');
+      if (existingSpan) {{
+        if (existingSpan.textContent !== formattedTotal) existingSpan.textContent = formattedTotal;
+        return;
+      }}
+      const span = document.createElement('span');
+      span.setAttribute('data-manual-day-total', 'fallback');
+      span.textContent = formattedTotal;
+      wrapper.appendChild(span);
+      return;
+    }}
+
+    const existingInner = headerEl.querySelector('[data-manual-day-total]');
+    if (existingInner) {{
+      if (existingInner.textContent !== formattedTotal) existingInner.textContent = formattedTotal;
+      return;
+    }}
+    if (headerEl.tagName.toLowerCase() !== 'span') {{
+      headerEl.style.display = 'flex';
+      headerEl.style.justifyContent = 'space-between';
+      headerEl.style.alignItems = 'baseline';
+      headerEl.style.width = '100%';
+    }}
+    const span = document.createElement('span');
+    span.setAttribute('data-manual-day-total', 'fallback');
+    span.textContent = formattedTotal;
+    headerEl.appendChild(span);
+  }}
+
+  function collectDomFallbackDaySum(dh) {{
+    try {{
+      let anchor = dh.container;
+      let steps = 0;
+      while (anchor && !anchor.nextElementSibling && anchor.parentElement && anchor.parentElement !== document.body && steps < 3) {{
+        anchor = anchor.parentElement;
+        steps += 1;
+      }}
+      if (!anchor || !anchor.parentElement) return 0;
+      let sum = 0;
+      let sib = anchor.nextElementSibling;
+      while (sib) {{
+        if (sib.matches && (sib.matches('[data-qa-type="atom-operations-feed-header"]') || sib.querySelector('[data-qa-type="atom-operations-feed-header"]'))) {{
+          break;
+        }}
+        const opNodes = (sib.matches && (sib.matches('[data-qa-type="mobile-pumba-account-operation"]') || sib.matches('[data-qa-type="molecule-account-operation"]')))
+          ? [sib]
+          : Array.prototype.slice.call(sib.querySelectorAll('[data-qa-type="mobile-pumba-account-operation"], [data-qa-type="molecule-account-operation"]'));
+        if (opNodes.length) {{
+          opNodes.forEach(function (opEl) {{
+            if (opEl.matches('[data-qa-type="mobile-pumba-account-operation"]') && opEl.querySelector('[data-qa-type="molecule-account-operation"]')) {{
+              const innerMol = opEl.querySelector('[data-qa-type="molecule-account-operation"]');
+              if (innerMol) opEl = innerMol;
+            }}
+            const amtCands = opEl.querySelectorAll('[data-qa-type="atom-sensitive__text"], [data-qa-type="uikit/money"], [data-qa-type="moneyAmount"]');
+            for (let i = 0; i < amtCands.length; i++) {{
+              const raw = normalizeUiText(amtCands[i].textContent || '').replace(/\\u00a0/g, ' ').trim();
+              if (!raw || raw.indexOf('₽') === -1 || raw.indexOf('%') !== -1) continue;
+              if (raw[0] === '+') break;
+              const val = parseDisplayedAmountRub(raw);
+              if (val && val > 0) {{
+                sum += val;
+                break;
+              }}
+            }}
+          }});
+        }} else {{
+          const stxt = normalizeUiText(sib.textContent || '').replace(/\\u00a0/g, ' ').trim();
+          const cleanHead = stxt.replace(TRAILING_AMOUNT_REGEX, '').trim();
+          if (DATE_HEADER_REGEX.test(cleanHead)) break;
+        }}
+        sib = sib.nextElementSibling;
+      }}
+      return sum;
+    }} catch (_) {{
+      return 0;
+    }}
+  }}
+
+  function syncDaySpendingTotals() {{
+    if (!isOperationsFeedRouteForDayTotals()) return;
+    ensurePaymentHistorySubtitleStyles();
+    ensureRouteScopeFreshForDayTotals();
+    recomputeDaySpendingMap();
+    const map = window.__TBANK_DAY_SPENDING_MAP || Object.create(null);
+    const curYearSuffix = ' ' + String(new Date().getFullYear());
+    const headers = findDateHeaderElements();
+    headers.forEach(function (dh) {{
+      const norm = dh.title.toLowerCase().replace(/\\s+/g, ' ').trim();
+      let total = Number(map[norm] || 0);
+      if (!total && norm.endsWith(curYearSuffix)) {{
+        const stripped = norm.slice(0, -curYearSuffix.length).trim();
+        total = Number(map[stripped] || 0);
+      }}
+      if (!total) {{
+        const domSum = collectDomFallbackDaySum(dh);
+        if (domSum > 0) total = domSum;
+      }}
+      applyDayTotalToHeader(dh, total);
+    }});
+  }}
+
+  function startDaySpendingTotalsSync() {{
+    scanEmbeddedSsrOps();
+    syncDaySpendingTotals();
+    syncDaySpendingFromPanelApi(true);
+    let timer = 0;
+    const schedule = function () {{
+      window.clearTimeout(timer);
+      timer = window.setTimeout(syncDaySpendingTotals, 60);
+    }};
+    try {{
+      const root = document.body || document.documentElement;
+      if (root) {{
+        const mo = new MutationObserver(schedule);
+        mo.observe(root, {{ childList: true, subtree: true }});
+      }}
+    }} catch (e) {{}}
+    try {{
+      document.addEventListener('visibilitychange', function () {{
+        if (document.visibilityState === 'visible') {{
+          syncDaySpendingFromPanelApi(false);
+          syncDaySpendingTotals();
+        }}
+      }});
+      window.addEventListener('focus', function () {{
+        syncDaySpendingFromPanelApi(false);
+      }}, {{ passive: true }});
+    }} catch (_) {{}}
+    window.setInterval(function () {{
+      syncDaySpendingTotals();
+      syncDaySpendingFromPanelApi(false);
+    }}, 3500);
+  }}
+
+  function _patchSingleOperationsPayload(node, canMerge) {{
+    if (!node || typeof node !== 'object') return false;
+    const lists = collectLists(node);
+    if (!lists.length) return false;
+    const opLists = lists.filter(function (lst) {{
+      return isRelayEdges(lst) || (Array.isArray(lst) && lst.some(isOperationRow));
+    }});
+    if (!opLists.length) return false;
+    let modified = false;
+    if (canMerge) {{
+      const sorted = opLists.slice().sort(function (a, b) {{ return b.length - a.length; }});
+      if (sorted[0] && mergeIntoList(sorted[0])) modified = true;
+    }}
+    opLists.forEach(function (lst) {{
+      try {{ recordDaySpendingFromList(lst); }} catch (_) {{}}
+    }});
+    return modified;
+  }}
+
   function patchData(data, url) {{
     if (!data || typeof data !== 'object') return data;
     try {{ patchSbpBankCatalogLogos(data); }} catch (_) {{}}
-    if (!shouldPatchOperationsList()) return data;
-    const lists = collectLists(data);
-    if (!lists.length) return data;
-    const primary = lists.slice().sort((a, b) => b.length - a.length)[0];
-    mergeIntoList(primary);
+    const canMerge = shouldPatchOperationsList();
+    const trackDay = canMerge || isOperationsFeedRouteForDayTotals();
+    if (!canMerge && !trackDay) return data;
+    if (Array.isArray(data)) {{
+      data.forEach(function (entry) {{
+        if (entry && typeof entry === 'object') _patchSingleOperationsPayload(entry, canMerge);
+      }});
+    }} else {{
+      _patchSingleOperationsPayload(data, canMerge);
+    }}
+    try {{ setTimeout(syncDaySpendingTotals, 40); }} catch (_) {{}}
     return data;
   }}
 
@@ -4594,6 +5427,14 @@ def _build_script() -> str:
   function looksLikeOperationsRequest(url) {{
     const low = String(url || '').toLowerCase();
     if (!low) return false;
+    const excludes = [
+      '/__tbankmitm_panel', '127.0.0.1:808', 'localhost:808',
+      'invoice', 'my_invoices', 'invoices_to_pay', 'get_invoices',
+      '/cm/', 'histogram', 'category_list', 'web-gateway',
+      'log/collect', 'openbanking', '/now', 'stories',
+      'allbundles', 'settings', 'tracker/'
+    ];
+    if (excludes.some((x) => low.indexOf(x) !== -1)) return false;
     return ['operations', 'operation', 'history', 'feed', 'transaction', 'statement', 'movement', 'registry', 'transfer', 'sbp', 'p2p', 'me2me', 'graphql', 'member', 'provider', 'providers', 'banklist', 'banks', 'nspk', 'requisites', 'commission']
       .some((x) => low.indexOf(x) !== -1);
   }}
@@ -4601,8 +5442,82 @@ def _build_script() -> str:
   function looksLikeBankCatalogRequest(url) {{
     const low = String(url || '').toLowerCase();
     if (!low) return false;
+    if (low.indexOf('/__tbankmitm_panel') !== -1 || low.indexOf('127.0.0.1:808') !== -1 || low.indexOf('localhost:808') !== -1) return false;
     return ['member', 'provider', 'providers', 'banklist', 'banks', 'nspk', 'sbp', 'p2p', 'phone-transfer', 'phonetransfer', 'requisites', 'commission']
       .some((x) => low.indexOf(x) !== -1);
+  }}
+
+  function handleInterceptedJsonPayload(data, finalUrl, isCatalog) {{
+    if (!data || typeof data !== 'object') return {{ data: data, mutateText: false }};
+    let mutateText = false;
+    try {{
+      if (isCatalog) {{
+        patchSbpBankCatalogLogos(data);
+        mutateText = true;
+      }}
+    }} catch (_) {{}}
+    const canMerge = shouldPatchOperationsList();
+    const trackDay = canMerge || isOperationsFeedRouteForDayTotals() || looksLikeOperationsRequest(finalUrl);
+    if (!trackDay) return {{ data: data, mutateText: mutateText }};
+    try {{
+      if (Array.isArray(data)) {{
+        data.forEach(function (entry) {{
+          if (_patchSingleOperationsPayload(entry, canMerge)) mutateText = true;
+        }});
+      }} else {{
+        if (_patchSingleOperationsPayload(data, canMerge)) mutateText = true;
+      }}
+      try {{ setTimeout(syncDaySpendingTotals, 40); }} catch (_) {{}}
+    }} catch (_) {{}}
+    return {{ data: data, mutateText: mutateText }};
+  }}
+
+  function wrapFetchResponseForOps(response, finalUrl, isCatalog) {{
+    if (!response || response.__tbWrapped) return response;
+    try {{
+      Object.defineProperty(response, '__tbWrapped', {{ value: true, configurable: true }});
+    }} catch (_) {{
+      response.__tbWrapped = true;
+    }}
+    try {{
+      if (typeof response.clone === 'function') {{
+        const originalClone = response.clone.bind(response);
+        response.clone = function () {{
+          const cloned = originalClone();
+          return wrapFetchResponseForOps(cloned, finalUrl, isCatalog);
+        }};
+      }}
+    }} catch (_) {{}}
+    try {{
+      if (typeof response.json === 'function') {{
+        const originalJson = response.json.bind(response);
+        response.json = async function () {{
+          const data = await originalJson();
+          try {{
+            return handleInterceptedJsonPayload(data, finalUrl, isCatalog).data;
+          }} catch (_) {{
+            return data;
+          }}
+        }};
+      }}
+    }} catch (_) {{}}
+    try {{
+      if (typeof response.text === 'function') {{
+        const originalText = response.text.bind(response);
+        response.text = async function () {{
+          const txt = await originalText();
+          try {{
+            const trimmed = String(txt || '').trim();
+            if (!trimmed || (trimmed[0] !== '{{' && trimmed[0] !== '[')) return txt;
+            const parsed = JSON.parse(trimmed);
+            const res = handleInterceptedJsonPayload(parsed, finalUrl, isCatalog);
+            if (res.mutateText) return JSON.stringify(res.data);
+          }} catch (_) {{}}
+          return txt;
+        }};
+      }}
+    }} catch (_) {{}}
+    return response;
   }}
 
   const originalFetch = window.fetch ? window.fetch.bind(window) : null;
@@ -4612,30 +5527,160 @@ def _build_script() -> str:
       try {{
         const req = arguments[0];
         const reqUrl = typeof req === 'string' ? req : (req && req.url) || '';
-        const finalUrl = response.url || reqUrl;
+        const finalUrl = (response && response.url) || reqUrl;
         const catalog = looksLikeBankCatalogRequest(finalUrl);
-        if (!shouldPatchOperationsList() && !catalog) return response;
-        if (!looksLikeOperationsRequest(finalUrl) && !catalog) return response;
-        const contentType = String((response.headers && response.headers.get && response.headers.get('content-type')) || '').toLowerCase();
-        if (contentType.indexOf('json') === -1 && contentType.indexOf('graphql') === -1) return response;
-        const originalJson = response.json.bind(response);
-        response.json = async function () {{
-          const data = await originalJson();
-          try {{
-            if (catalog && !shouldPatchOperationsList()) {{
-              patchSbpBankCatalogLogos(data);
-              return data;
-            }}
-            return patchData(data, finalUrl);
-          }} catch (e) {{
-            return data;
-          }}
-        }};
+        const opsReq = looksLikeOperationsRequest(finalUrl);
+        if (!opsReq && !catalog) return response;
+        const contentType = String((response && response.headers && response.headers.get && response.headers.get('content-type')) || '').toLowerCase();
+        if (contentType && contentType.indexOf('json') === -1 && contentType.indexOf('graphql') === -1 && contentType.indexOf('text/plain') === -1) {{
+          return response;
+        }}
+        return wrapFetchResponseForOps(response, finalUrl, catalog);
       }} catch (e) {{
       }}
       return response;
     }};
   }}
+
+  (function hookXmlHttpRequestForOps() {{
+    try {{
+      if (typeof XMLHttpRequest === 'undefined' || !XMLHttpRequest.prototype) return;
+      if (XMLHttpRequest.prototype.__tbXhrHooked) return;
+      XMLHttpRequest.prototype.__tbXhrHooked = true;
+      const origOpen = XMLHttpRequest.prototype.open;
+      const origSend = XMLHttpRequest.prototype.send;
+      const origRespDesc = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
+      const origRespTextDesc = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'responseText');
+
+      function resolveXhrPatched(xhr) {{
+        if (!xhr || xhr.readyState !== 4) return null;
+        if (xhr.__tbResolvedCache) return xhr.__tbResolvedCache;
+        const url = String(xhr.responseURL || xhr.__tbUrl || '');
+        const catalog = looksLikeBankCatalogRequest(url);
+        const opsReq = looksLikeOperationsRequest(url);
+        if (!opsReq && !catalog) {{
+          xhr.__tbResolvedCache = {{ skip: true }};
+          return xhr.__tbResolvedCache;
+        }}
+        let ctype = '';
+        try {{ ctype = String(xhr.getResponseHeader('content-type') || '').toLowerCase(); }} catch (_) {{}}
+        if (ctype && ctype.indexOf('json') === -1 && ctype.indexOf('graphql') === -1 && ctype.indexOf('text/plain') === -1) {{
+          xhr.__tbResolvedCache = {{ skip: true }};
+          return xhr.__tbResolvedCache;
+        }}
+        const rtype = String(xhr.responseType || '').toLowerCase();
+        let rawObj = null;
+        let rawText = null;
+        if (rtype === '' || rtype === 'text') {{
+          rawText = origRespTextDesc && origRespTextDesc.get ? origRespTextDesc.get.call(xhr) : null;
+          if (typeof rawText === 'string') {{
+            const trimmed = rawText.trim();
+            if (trimmed && (trimmed[0] === '{{' || trimmed[0] === '[')) {{
+              try {{ rawObj = JSON.parse(trimmed); }} catch (_) {{ rawObj = null; }}
+            }}
+          }}
+        }} else if (rtype === 'json') {{
+          rawObj = origRespDesc && origRespDesc.get ? origRespDesc.get.call(xhr) : null;
+        }}
+        if (!rawObj || typeof rawObj !== 'object') {{
+          xhr.__tbResolvedCache = {{ skip: true }};
+          return xhr.__tbResolvedCache;
+        }}
+        const res = handleInterceptedJsonPayload(rawObj, url, catalog);
+        const patchedText = (rtype === '' || rtype === 'text')
+          ? (res.mutateText ? JSON.stringify(res.data) : rawText)
+          : null;
+        xhr.__tbResolvedCache = {{
+          skip: false,
+          obj: res.data,
+          text: patchedText,
+          mutateText: !!res.mutateText
+        }};
+        return xhr.__tbResolvedCache;
+      }}
+
+      XMLHttpRequest.prototype.open = function (method, url) {{
+        try {{
+          this.__tbUrl = String(url || '');
+          this.__tbResolvedCache = null;
+        }} catch (_) {{}}
+        return origOpen.apply(this, arguments);
+      }};
+
+      XMLHttpRequest.prototype.send = function () {{
+        try {{
+          this.addEventListener('load', function () {{
+            try {{ resolveXhrPatched(this); }} catch (_) {{}}
+          }});
+        }} catch (_) {{}}
+        return origSend.apply(this, arguments);
+      }};
+
+      if (origRespTextDesc && origRespTextDesc.get && origRespTextDesc.configurable) {{
+        Object.defineProperty(XMLHttpRequest.prototype, 'responseText', {{
+          configurable: true,
+          enumerable: origRespTextDesc.enumerable,
+          get: function () {{
+            const raw = origRespTextDesc.get.call(this);
+            try {{
+              const c = resolveXhrPatched(this);
+              if (c && !c.skip && c.mutateText && typeof c.text === 'string') return c.text;
+            }} catch (_) {{}}
+            return raw;
+          }}
+        }});
+      }}
+
+      if (origRespDesc && origRespDesc.get && origRespDesc.configurable) {{
+        Object.defineProperty(XMLHttpRequest.prototype, 'response', {{
+          configurable: true,
+          enumerable: origRespDesc.enumerable,
+          get: function () {{
+            const raw = origRespDesc.get.call(this);
+            try {{
+              const c = resolveXhrPatched(this);
+              if (!c || c.skip || !c.mutateText) return raw;
+              const rtype = String(this.responseType || '').toLowerCase();
+              if (rtype === 'json') return c.obj;
+              if ((rtype === '' || rtype === 'text') && typeof c.text === 'string') return c.text;
+            }} catch (_) {{}}
+            return raw;
+          }}
+        }});
+      }}
+    }} catch (_) {{}}
+  }})();
+
+  function onSpaNavigation() {{
+    try {{ patchDetailDom(); }} catch (_) {{}}
+    try {{ syncFinanalyticsCards(); }} catch (_) {{}}
+    try {{ syncDaySpendingTotals(); }} catch (_) {{}}
+    try {{ syncDaySpendingFromPanelApi(false); }} catch (_) {{}}
+    window.setTimeout(function () {{
+      try {{ syncDaySpendingTotals(); }} catch (_) {{}}
+      try {{ syncFinanalyticsCards(); }} catch (_) {{}}
+    }}, 180);
+    window.setTimeout(function () {{
+      try {{ syncDaySpendingTotals(); }} catch (_) {{}}
+    }}, 650);
+  }}
+
+  (function hookHistoryNavigation() {{
+    try {{
+      if (window.__tbankHistoryNavHooked || typeof history === 'undefined') return;
+      window.__tbankHistoryNavHooked = true;
+      ['pushState', 'replaceState'].forEach(function (fnName) {{
+        const orig = history[fnName];
+        if (typeof orig !== 'function') return;
+        history[fnName] = function () {{
+          const ret = orig.apply(this, arguments);
+          try {{ onSpaNavigation(); }} catch (_) {{}}
+          return ret;
+        }};
+      }});
+      window.addEventListener('popstate', onSpaNavigation, {{ passive: true }});
+    }} catch (_) {{}}
+  }})();
 
   function startDetailDomPatcher() {{
     injectManualDetailStyles();
@@ -4684,14 +5729,81 @@ def _build_script() -> str:
     document.addEventListener('DOMContentLoaded', function () {{
       startDetailDomPatcher();
       startFinanalyticsCardSync();
+      startDaySpendingTotalsSync();
     }}, {{ once: true }});
   }} else {{
     startDetailDomPatcher();
     startFinanalyticsCardSync();
+    startDaySpendingTotalsSync();
   }}
 }})();
 </script>
 """
+
+
+_KILLER_SW_JS = (
+    "self.addEventListener('install', function () { self.skipWaiting(); });\n"
+    "self.addEventListener('activate', function (event) {\n"
+    "  event.waitUntil(\n"
+    "    caches.keys()\n"
+    "      .then(function (keys) { return Promise.all(keys.map(function (k) { return caches.delete(k); })); })\n"
+    "      .then(function () { return self.registration.unregister(); })\n"
+    "      .then(function () { return self.clients.matchAll({ type: 'window' }); })\n"
+    "      .then(function (clients) {\n"
+    "        clients.forEach(function (client) { try { client.navigate(client.url); } catch (_) {} });\n"
+    "      })\n"
+    "      .catch(function () {})\n"
+    "  );\n"
+    "});\n"
+)
+
+
+def _is_same_origin_panel_flow(flow: http.HTTPFlow) -> bool:
+    meta = getattr(flow, "metadata", None)
+    if isinstance(meta, dict) and meta.get("tbankmitm_same_origin_panel"):
+        return True
+    url = (flow.request.pretty_url or "").lower()
+    return "/__tbankmitm_panel" in url
+
+
+def request(flow: http.HTTPFlow) -> None:
+    if not flow.request or not is_bank_flow(flow):
+        return
+    if _is_same_origin_panel_flow(flow):
+        return
+    path = (flow.request.path or "").split("?", 1)[0].lower()
+
+    sw_hdr = (flow.request.headers.get("service-worker") or "").strip().lower()
+    if sw_hdr == "script" or path.endswith(("/sw.js", "/service-worker.js", "/serviceworker.js")):
+        flow.response = http.Response.make(
+            200,
+            _KILLER_SW_JS.encode("utf-8"),
+            {
+                "Content-Type": "application/javascript; charset=utf-8",
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Service-Worker-Allowed": "/",
+            },
+        )
+        return
+
+    sec_dest = (flow.request.headers.get("sec-fetch-dest") or "").strip().lower()
+    accept = (flow.request.headers.get("accept") or "").strip().lower()
+    is_static_asset = path.endswith((
+        ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
+        ".woff", ".woff2", ".ttf", ".otf", ".eot", ".ico", ".map", ".json", ".wasm",
+    ))
+    is_html_nav = (
+        sec_dest in ("document", "iframe")
+        or ("text/html" in accept and not is_static_asset)
+        or (not is_static_asset and (path == "/" or path.startswith("/mybank") or path.startswith("/auth")))
+    )
+    if is_html_nav and not ("/mybank/statements" in path or "mybank%2fstatements" in path):
+        flow.request.headers.pop("If-None-Match", None)
+        flow.request.headers.pop("if-none-match", None)
+        flow.request.headers.pop("If-Modified-Since", None)
+        flow.request.headers.pop("if-modified-since", None)
 
 
 def response(flow: http.HTTPFlow) -> None:
@@ -4700,34 +5812,56 @@ def response(flow: http.HTTPFlow) -> None:
         return
     if not flow.response:
         return
-    ensure_response_decoded(flow)
-    url = (flow.request.pretty_url or "").lower()
-    if "/mybank" not in url:
+    if _is_same_origin_panel_flow(flow):
         return
+    url = (flow.request.pretty_url or "").lower()
+    path = (flow.request.path or "").split("?", 1)[0].lower()
     # Не вмешиваться в HTML «Справок» — тяжёлый скрипт + CSP; диагностика «страница не грузится».
     if "/mybank/statements" in url or "mybank%2fstatements" in url:
+        return
+    if "/api/" in path:
         return
     content_type = (flow.response.headers.get("content-type") or "").lower()
     if "text/html" not in content_type:
         return
+    ensure_response_decoded(flow)
     html = flow.response.text or ""
     if not html or "__manualOpsBrowserInjector" in html:
         return
-    script = _build_script()
-    if "</body>" in html:
-        html = html.replace("</body>", script + "\n</body>", 1)
-    else:
-        html += script
+    low_html = html.lower()
+    if not ("</head" in low_html or "</body" in low_html or "<html" in low_html or "<!doctype" in low_html):
+        return
     html = re.sub(
-        r'<meta[^>]+http-equiv=["\']Content-Security-Policy["\'][^>]*>',
+        r'<meta[^>]+http-equiv=["\']Content-Security-Policy(?:-Report-Only)?["\'][^>]*>',
         "",
         html,
         flags=re.IGNORECASE,
     )
+    script = _build_script()
+    m_head = re.search(r"</head\s*>", html, re.IGNORECASE)
+    if m_head:
+        html = html[:m_head.start()] + script + "\n" + html[m_head.start():]
+    else:
+        m_body = re.search(r"</body\s*>", html, re.IGNORECASE)
+        if m_body:
+            html = html[:m_body.start()] + script + "\n" + html[m_body.start():]
+        else:
+            html += script
     flow.response.text = html
-    flow.response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    flow.response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     flow.response.headers["Pragma"] = "no-cache"
-    flow.response.headers.pop("Content-Security-Policy", None)
-    flow.response.headers.pop("content-security-policy", None)
-    flow.response.headers.pop("Content-Security-Policy-Report-Only", None)
-    flow.response.headers.pop("content-security-policy-report-only", None)
+    flow.response.headers["Expires"] = "0"
+    for hdr_name in (
+        "ETag",
+        "etag",
+        "Last-Modified",
+        "last-modified",
+        "Service-Worker-Allowed",
+        "service-worker-allowed",
+        "Content-Security-Policy",
+        "content-security-policy",
+        "Content-Security-Policy-Report-Only",
+        "content-security-policy-report-only",
+        "X-Content-Security-Policy",
+    ):
+        flow.response.headers.pop(hdr_name, None)

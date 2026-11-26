@@ -1,5 +1,6 @@
 # Трафик Т‑Банка / приложения (часть запросов — по Host/SNI, без «tbank» в полном URL).
 import os
+from urllib.parse import urlparse
 
 _BANK_KEYS = (
     "tbank",
@@ -7,6 +8,8 @@ _BANK_KEYS = (
     "t-co.ru",
     "tinkoffbank",
     "tbank-online.com",
+    "t-static.ru",
+    "cdn-tinkoff.ru",
 )
 
 # Зеркала и основные домены веб-банка (Referer / Host).
@@ -62,6 +65,11 @@ def map_same_origin_panel_request(flow) -> bool:
         if not inner.startswith("/"):
             inner = "/" + inner
         flow.request.path = inner + query
+        # Помечаем flow в metadata: следующий аддон (panel_bridge после history) увидит
+        # переписанный /api/* путь и не должен отбрасывать запрос как обычный трафик банка.
+        meta = getattr(flow, "metadata", None)
+        if isinstance(meta, dict):
+            meta["tbankmitm_same_origin_panel"] = True
         return True
     except Exception:
         return False
@@ -70,8 +78,8 @@ def map_same_origin_panel_request(flow) -> bool:
 def bank_https_panel_request(flow) -> bool:
     """
     True для HTTPS PWA, где panel_bridge/history обслуживают /api/* и /panel-bank-logo.
-    Важно: после map_same_origin_panel_request путь уже /panel-bank-logo — второй аддон
-    не должен выходить из request(), иначе логотипы в ленте 404.
+    Важно: после map_same_origin_panel_request путь уже /api/* или /panel-bank-logo — второй аддон
+    не должен выходить из request(), иначе /api/effective_balance и логотипы дают 404.
     """
     try:
         port = int(getattr(flow.request, "port", 0) or 0)
@@ -79,6 +87,9 @@ def bank_https_panel_request(flow) -> bool:
             return False
         if not _bank_https_host(getattr(flow.request, "host", "") or ""):
             return False
+        meta = getattr(flow, "metadata", None)
+        if isinstance(meta, dict) and meta.get("tbankmitm_same_origin_panel"):
+            return True
         raw = flow.request.path or ""
         path_only = raw.split("?", 1)[0]
         if path_only.startswith(SAME_ORIGIN_PANEL_PREFIX):
@@ -222,19 +233,44 @@ def text_indicates_statements_spravki(
     return False
 
 
+_PROHIBIT_JSON_MUTATION_FRAGMENTS = (
+    "/api/cfg/",
+    "/api/front/log",
+    "/api/front/supreme",
+    "eventea",
+    "statist",
+    "id.tbank.ru/auth",
+    "mappings/prod/",
+    "cm/my_invoices",
+    "cm/invoices_to_pay",
+    "get_invoices",
+    "allbundles",
+    "/settings/openbanking",
+)
+
+
 def url_prohibit_proxy_json_mutation(url: str) -> bool:
     """
-    Ответы, которые нельзя json.loads + патчить прокси-скриптами: ломается Tramvai / «Справки».
+    Ответы, которые нельзя json.loads + патчить прокси-скриптами: ломается Tramvai / Zod / SSO / «Справки».
 
-    - /api/cfg/web-gateway/getResponse — огромное дерево микрофронтов; apply_hidden / inject
-      находили «кандидатов»-списки и портили JSON при has_operation_candidates.
+    - /api/cfg/* (включая web-gateway), /api/front/log, /api/front/supreme, eventea, statist,
+      id.tbank.ru/auth, mappings/prod/, allbundles, *.json на cdn.tbank.ru — конфиги/телеметрия/авторизация/бандлы.
     - cx-evolution-api … documents — запросы справок (filter-new-document и т.д.).
+    - cm/my_invoices, cm/invoices_to_pay, get_invoices — счета на оплату (строгая Zod-схема).
     """
     u = (url or "").lower()
-    if "/api/cfg/web-gateway" in u:
+    if any(frag in u for frag in _PROHIBIT_JSON_MUTATION_FRAGMENTS):
         return True
     if "cx-evolution-api" in u and "document" in u:
         return True
+    try:
+        parsed = urlparse(u)
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+        if (host == "cdn.tbank.ru" or host.endswith(".cdn.tbank.ru")) and path.endswith(".json"):
+            return True
+    except Exception:
+        pass
     return False
 
 

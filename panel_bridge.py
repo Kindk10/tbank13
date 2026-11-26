@@ -2245,13 +2245,16 @@ def response(flow: http.HTTPFlow) -> None:
     if histogram_like:
         try:
             data = json.loads(flow.response.text)
-            history.record_bank_histogram_from_payload(data)
+            history.record_bank_histogram_from_payload(data, url)
             display_income, display_expense, _, _ = history.get_panel_chart_display_totals()
+            without_transfer = any(
+                x in ul for x in ("withouttransfer", "without_transfer", "groupfilter=without_transfer")
+            )
 
             def replace_histogram_amounts(obj, income, expense):
                 if isinstance(obj, dict):
-                    if "earning" in obj and "summary" in obj["earning"]:
-                        if "value" in obj["earning"]["summary"]:
+                    if "earning" in obj and isinstance(obj["earning"], dict) and "summary" in obj["earning"]:
+                        if isinstance(obj["earning"]["summary"], dict) and "value" in obj["earning"]["summary"]:
                             old_income = obj["earning"]["summary"]["value"]
                             obj["earning"]["summary"]["value"] = income
                             if "intervals" in obj["earning"] and old_income > 0 and income > 0:
@@ -2260,8 +2263,8 @@ def response(flow: http.HTTPFlow) -> None:
                                         for cat in interval["aggregated"]:
                                             if "amount" in cat and "value" in cat["amount"]:
                                                 cat["amount"]["value"] = round(cat["amount"]["value"] * income / old_income, 2)
-                    if "spending" in obj and "summary" in obj["spending"]:
-                        if "value" in obj["spending"]["summary"]:
+                    if "spending" in obj and isinstance(obj["spending"], dict) and "summary" in obj["spending"]:
+                        if isinstance(obj["spending"]["summary"], dict) and "value" in obj["spending"]["summary"]:
                             old_expense = obj["spending"]["summary"]["value"]
                             obj["spending"]["summary"]["value"] = expense
                             if "intervals" in obj["spending"] and old_expense > 0 and expense > 0:
@@ -2276,8 +2279,14 @@ def response(flow: http.HTTPFlow) -> None:
                     for item in obj:
                         replace_histogram_amounts(item, income, expense)
 
-            replace_histogram_amounts(data, display_income, display_expense)
+            if not without_transfer:
+                replace_histogram_amounts(data, display_income, display_expense)
+            history.apply_daily_histogram_interval_adjustments(data, url)
             flow.response.text = json.dumps(data, ensure_ascii=False)
+            for hdr in ("ETag", "etag", "Last-Modified", "last-modified", "Expires", "expires"):
+                flow.response.headers.pop(hdr, None)
+            flow.response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            flow.response.headers["Pragma"] = "no-cache"
             print(f"[panel] Подменены гистограммы для {url} (доходы: {display_income}, расходы: {display_expense})")
         except Exception as e:
             print(f"[panel] Ошибка подмены гистограммы: {e}")

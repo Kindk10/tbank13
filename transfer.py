@@ -8,7 +8,7 @@ import sys
 import fitz
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bank_filter import is_bank_flow, ensure_response_decoded, is_jsonish_response
+from bank_filter import is_bank_flow, ensure_response_decoded, is_jsonish_response, url_prohibit_proxy_json_mutation
 import history as history_mod
 import controller as ctrl
 from pathlib import Path
@@ -351,12 +351,11 @@ def save_data(data):
 
 
 def _is_operations_feed_url(url: str) -> bool:
-    """Только лента /api/common/v1/operations — не operations_category_list_*."""
-    path_only = (url or "").split("?", 1)[0].lower().rstrip("/")
-    if "/api/common/v1/operations" not in path_only:
+    """Только ленты /api/common/v1/operations и /legacy/v1/operations — не histogram/category_list/invoices."""
+    if url_prohibit_proxy_json_mutation(url):
         return False
-    after = path_only.split("/api/common/v1/operations", 1)[-1]
-    return after == "" or after.startswith("?")
+    path_only = (url or "").split("?", 1)[0].lower().rstrip("/")
+    return path_only.endswith("/api/common/v1/operations") or path_only.endswith("/legacy/v1/operations")
 
 
 def clean_sender_name(full_name):
@@ -408,6 +407,15 @@ def _build_fake_record(operation_id: str, op_ts_ms: int, pdf_path=None) -> dict:
     else:
         display_name = transfer_data.get("receiver_name") or transfer_data.get("bank_receiver", "Т-Банк")
         logo_url = transfer_data.get("bank_logo") or get_bank_logo(transfer_data.get("bank_receiver", "Т-Банк"))
+    amt_raw = round(abs(float(transfer_data.get("amount", 0) or 0)), 2)
+    amt_val = int(amt_raw) if abs(amt_raw - int(amt_raw)) < 1e-9 else amt_raw
+    rub_cur = {"code": 643, "name": "RUB", "strCode": "643"}
+    date_full = (transfer_data.get("date_full") or "").strip()
+    if not date_full:
+        try:
+            date_full = history_mod.millis_to_bank_date_str(op_ts_ms)
+        except Exception:
+            date_full = datetime.now().strftime("%d.%m.%Y, %H:%M:%S")
     return {
         "id": operation_id,
         "operationId": {"value": operation_id, "source": "PrimeAuth"},
@@ -417,17 +425,22 @@ def _build_fake_record(operation_id: str, op_ts_ms: int, pdf_path=None) -> dict:
         "ucid": "1386102627",
         "cardNumber": "220070******6404",
         "authorizationId": operation_id,
-        "operationTime": {"milliseconds": op_ts_ms},
+        "operationTime": {"milliseconds": op_ts_ms, "seconds": op_ts_ms / 1000},
         "debitingTime": {"milliseconds": op_ts_ms},
         "type": "Debit",
+        "operationType": "Debit",
         "status": "OK",
-        "amount": {"value": int(transfer_data.get("amount", 0)), "currency": {"code": 643, "name": "RUB", "strCode": "643"}},
-        "accountAmount": {"value": int(transfer_data.get("amount", 0)), "currency": {"code": 643, "name": "RUB", "strCode": "643"}},
+        "amount": {"value": amt_val, "currency": dict(rub_cur)},
+        "accountAmount": {"value": amt_val, "currency": dict(rub_cur)},
+        "signedAmount": {"value": -amt_val, "currency": dict(rub_cur)},
+        "debitAmount": {"value": amt_val, "currency": dict(rub_cur)},
+        "creditAmount": {"value": 0.0, "currency": dict(rub_cur)},
         "cashback": 0.0,
-        "cashbackAmount": {"value": 0.0, "currency": {"code": 643, "name": "RUB", "strCode": "643"}},
+        "cashbackAmount": {"value": 0.0, "currency": dict(rub_cur)},
         "idSourceType": "Prime",
         "mcc": 0,
         "mccString": "0000",
+        "locations": [],
         "description": display_name,
         "category": {"id": "45", "name": "Другое"},
         "brand": {"id": "11250", "name": display_name, "logo": logo_url, "baseColor": "f12e16", "fileLink": logo_url},
@@ -468,11 +481,57 @@ def _build_fake_record(operation_id: str, op_ts_ms: int, pdf_path=None) -> dict:
         "merges": [],
         "documents": ["Statement"],
         "pdf_path": pdf_path,
-        "date_full": transfer_data.get("date_full") or "",
+        "date": date_full,
+        "date_full": date_full,
         "receiver_phone": str(transfer_data.get("receiver_phone") or "").strip(),
         "receiver_name": str(transfer_data.get("receiver_name") or "").strip(),
         "bank_receiver": str(transfer_data.get("bank_receiver") or "").strip(),
     }
+
+
+def _normalize_fake_record_for_feed(op: dict, ref: dict = None) -> dict:
+    """Дополняет сохранённую fake_history запись всеми обязательными полями Valibot-схемы ленты."""
+    out = dict(op)
+    amt_raw = 0.0
+    a = out.get("amount")
+    if isinstance(a, dict):
+        amt_raw = abs(float(a.get("value") or 0))
+    elif isinstance(a, (int, float)):
+        amt_raw = abs(float(a))
+    amt_val = int(amt_raw) if abs(amt_raw - int(amt_raw)) < 1e-9 else round(amt_raw, 2)
+    rub_cur = {"code": 643, "name": "RUB", "strCode": "643"}
+    op_type = str(out.get("type") or out.get("operationType") or "Debit")
+    title = str(out.get("description") or out.get("receiver_name") or "Перевод").strip()
+    out.setdefault("operationType", op_type)
+    out.setdefault("status", "OK")
+    out.setdefault("signedAmount", {"value": -amt_val if op_type == "Debit" else amt_val, "currency": dict(rub_cur)})
+    out.setdefault("debitAmount", {"value": amt_val if op_type == "Debit" else 0.0, "currency": dict(rub_cur)})
+    out.setdefault("creditAmount", {"value": amt_val if op_type == "Credit" else 0.0, "currency": dict(rub_cur)})
+    if not isinstance(out.get("locations"), list):
+        out["locations"] = []
+    if not isinstance(out.get("offers"), list):
+        out["offers"] = []
+    if not isinstance(out.get("loyaltyBonus"), list):
+        out["loyaltyBonus"] = []
+    if not isinstance(out.get("loyaltyPayment"), list):
+        out["loyaltyPayment"] = []
+    if not isinstance(out.get("loyaltyBonusSummary"), dict):
+        out["loyaltyBonusSummary"] = {"amount": 0.0}
+    ci = out.get("categoryInfo")
+    if not isinstance(ci, dict) or not isinstance(ci.get("metacategory"), dict) or not isinstance(ci.get("criteria"), dict):
+        out["categoryInfo"] = {
+            "bankCategory": {"id": "24", "language": "ru", "name": "Переводы", "baseColor": "4FC5DF", "fileLink": "https://brands-prod.cdn-tinkoff.ru/general_logo/transfers-c1.png"},
+            "metacategory": {"id": "12", "language": "ru", "name": "Финансы", "baseColor": "14B8AF", "fileLink": "https://bms-logo-prod.t-static.ru/general_logo/finance-3-meta.png"},
+            "criteria": {"bulkVariety": {"type": "Description", "value": title[:200]}},
+        }
+    if not out.get("date") and out.get("date_full"):
+        out["date"] = out["date_full"]
+    if isinstance(ref, dict):
+        for k in ("account", "card", "ucid"):
+            if ref.get(k):
+                out[k] = ref[k]
+    out["isInner"] = False
+    return out
 
 
 def _repair_fake_history_from_transfer() -> bool:
@@ -679,7 +738,10 @@ def _add_to_fake_history() -> bool:
     _last_fake_op_id = operation_id
     _last_fake_ts = current_time
     transfer_data["transaction_id"] = operation_id
-    op_ts_ms = int(current_time * 1000)
+    op_ts_ms = int(transfer_data.get("timestamp_ms") or 0)
+    if op_ts_ms <= 0 or abs(int(current_time * 1000) - op_ts_ms) > 15000:
+        op_ts_ms = int(current_time * 1000)
+        transfer_data["timestamp_ms"] = op_ts_ms
     try:
         from history import millis_to_bank_date_str as _msk_date
         transfer_data["date_full"] = _msk_date(op_ts_ms)
@@ -1154,6 +1216,8 @@ def response(flow: http.HTTPFlow) -> None:
                     fake_history = disk_fh
                     transfer_data["fake_history"] = fake_history
                 existing_ids = {item.get("id") for item in data["payload"] if isinstance(item, dict) and item.get("id")}
+                ref_op = data["payload"][0] if data["payload"] and isinstance(data["payload"][0], dict) else None
+                month_restrict = not history_mod.app_include_all_operations()
                 new_fakes = []
                 for op in fake_history:
                     if not isinstance(op, dict):
@@ -1162,21 +1226,34 @@ def response(flow: http.HTTPFlow) -> None:
                     if not oid or oid in existing_ids:
                         continue
                     try:
-                        if history_mod.is_fake_transfer_deleted(str(oid)):
+                        if history_mod.is_fake_transfer_deleted(str(oid)) or str(oid) in history_mod.hidden_operations:
+                            continue
+                        if month_restrict and not history_mod._fake_op_in_current_month(op):
                             continue
                     except Exception:
                         pass
-                    new_fakes.append(op)
+                    new_fakes.append(_normalize_fake_record_for_feed(op, ref_op))
                 if new_fakes:
                     data["payload"] = new_fakes + data["payload"]
+                    try:
+                        history_mod.sort_operations_newest_first(data["payload"])
+                    except Exception:
+                        pass
                     flow.response.text = json.dumps(data, ensure_ascii=False)
+                    for hdr in ("ETag", "etag", "Last-Modified", "last-modified", "Expires", "expires"):
+                        flow.response.headers.pop(hdr, None)
+                    flow.response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+                    flow.response.headers["Pragma"] = "no-cache"
         except Exception:
             pass
+
+    if url_prohibit_proxy_json_mutation(url):
+        return
 
     if any(x in url for x in ["get_requisites", "payment_commission", "pay", "providers"]):
         log_bank_fio(flow)
 
-    if any(x in url for x in ["web-gateway", "providers/find", "payment_commission", "get_requisites", "ping", "session_status", "bundles", "log/collect", "event", "histogram"]):
+    if any(x in url for x in ["web-gateway", "providers/find", "payment_commission", "get_requisites", "ping", "session_status", "bundles", "log/collect", "event", "histogram", "my_invoices", "invoices_to_pay", "get_invoices", "openbanking"]):
         return
 
     if _is_mock_pay_request(url, flow.request.method):
@@ -1248,14 +1325,26 @@ def request(flow: http.HTTPFlow) -> None:
                 amount = float(data.get("moneyAmount") or data.get("amount") or 0)
                 phone = data.get("providerFields", {}).get("pointer")
                 name = data.get("providerFields", {}).get("maskedFIO")
-        except:
+        except Exception:
             pass
+    else:
+        jbody = safe_json(body_text)
+        if isinstance(jbody, dict):
+            inner = jbody.get("payParameters") if isinstance(jbody.get("payParameters"), dict) else jbody
+            try:
+                amount = float(inner.get("moneyAmount") or inner.get("amount") or (inner.get("sum") or {}).get("value") if isinstance(inner.get("sum"), dict) else (inner.get("moneyAmount") or inner.get("amount") or 0))
+            except Exception:
+                amount = 0.0
+            pf = inner.get("providerFields") if isinstance(inner.get("providerFields"), dict) else inner
+            phone = pf.get("pointer") or pf.get("phone") or pf.get("recipientPhone")
+            name = pf.get("maskedFIO") or pf.get("receiverName") or pf.get("name")
 
     if amount > 0:
         _fake_payment_done = False
+        now_ms = int(time.time() * 1000)
         try:
             from history import millis_to_bank_date_str as _msk_date
-            _df = _msk_date(int(time.time() * 1000))
+            _df = _msk_date(now_ms)
         except Exception:
             try:
                 from history import now_moscow as _now_msk
@@ -1272,7 +1361,8 @@ def request(flow: http.HTTPFlow) -> None:
             "transaction_id": generate_id(),
             "kvit_number": generate_kvit(),
             "sbp_operation_id": generate_sbp_operation_id(),
-            "date_full": _df
+            "date_full": _df,
+            "timestamp_ms": now_ms,
         })
         save_data(transfer_data)
         print(f"Захвачено: {amount} руб, банк: {transfer_data['bank_receiver']}")
