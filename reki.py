@@ -6,39 +6,41 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bank_filter import (
     is_bank_flow,
+    is_bank_json_candidate,
     ensure_response_decoded,
-    bank_debug_enabled,
     is_jsonish_response,
     flow_statements_spravki_context,
-    url_prohibit_proxy_json_mutation,
+    mark_mutated_json_no_store,
 )
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+_CFG_CACHE = {"sig": None, "data": None}
+
 
 def get_config():
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return cfg["reki"]
+    st = os.stat(CONFIG_FILE)
+    sig = (st.st_mtime_ns, st.st_size)
+    if _CFG_CACHE["sig"] != sig or _CFG_CACHE["data"] is None:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            _CFG_CACHE["data"] = json.load(f)
+        _CFG_CACHE["sig"] = sig
+    return _CFG_CACHE["data"]["reki"]
+
 
 real_id = None
 
+
 def response(flow: http.HTTPFlow) -> None:
     global real_id
-    url = flow.request.pretty_url
-
-    if not is_bank_flow(flow):
+    if not is_bank_json_candidate(flow):
         return
-    if not flow.response:
+    url = flow.request.pretty_url
+    if "accounts_light_ib" not in url and "account_group_requisites" not in url:
         return
     if flow_statements_spravki_context(flow):
         return
     ensure_response_decoded(flow)
-    if not flow.response.text:
-        if bank_debug_enabled():
-            print(f"[reki] пустой ответ: {url[:120]}")
-        return
-
-    if not is_jsonish_response(flow):
+    if not flow.response.text or not is_jsonish_response(flow):
         return
 
     try:
@@ -83,6 +85,7 @@ def response(flow: http.HTTPFlow) -> None:
                     if isinstance(first, dict) and "id" in first:
                         first["id"] = NEW_CONTRACT
                 flow.response.text = json.dumps(data, ensure_ascii=False)
+                mark_mutated_json_no_store(flow)
         except Exception:
             pass
         return
@@ -114,8 +117,9 @@ def response(flow: http.HTTPFlow) -> None:
             
             if modified:
                 flow.response.text = json.dumps(data, ensure_ascii=False)
+                mark_mutated_json_no_store(flow)
                 
-        except Exception as e:
+        except Exception:
             pass
 
 def request(flow: http.HTTPFlow) -> None:

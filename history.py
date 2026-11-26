@@ -15,6 +15,7 @@ import controller
 import func
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bank_filter as _bank_filter_mod
 from bank_filter import (
     is_bank_flow,
     ensure_response_decoded,
@@ -29,6 +30,7 @@ from bank_filter import (
     request_is_panel_mitm_port,
     SAME_ORIGIN_PANEL_PREFIX,
 )
+_is_telemetry_or_log_url = getattr(_bank_filter_mod, "is_telemetry_or_log_url", None)
 
 try:
     from zoneinfo import ZoneInfo
@@ -1035,7 +1037,60 @@ def _apply_bank_brand_preset(out, op):
         out["merchant"] = {"name": bank}
 
 
-def _pwa_asset_origin() -> str:
+_WEB_ORIGIN_HOSTS = (
+    "www.tbank.ru",
+    "tbank.ru",
+    "www.tinkoff.ru",
+    "tinkoff.ru",
+    "www.tbank-online.com",
+    "tbank-online.com",
+)
+_last_detected_web_origin = ""
+
+
+def _extract_web_origin_from_flow(flow) -> str:
+    if flow is None or not getattr(flow, "request", None):
+        return ""
+    try:
+        hdrs = flow.request.headers
+        for hdr_name in ("Origin", "origin", "Referer", "referer"):
+            raw = hdrs.get(hdr_name)
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            raw = (raw or "").strip()
+            if not raw:
+                continue
+            p = urlparse(raw)
+            host = (p.hostname or "").lower()
+            if p.scheme in ("http", "https") and host in _WEB_ORIGIN_HOSTS:
+                return f"{p.scheme}://{p.netloc}"
+        host_hdr = hdrs.get("Host") or hdrs.get("host") or getattr(flow.request, "host", "") or ""
+        if isinstance(host_hdr, bytes):
+            host_hdr = host_hdr.decode("utf-8", "replace")
+        h_clean = host_hdr.split(":")[0].lower().strip()
+        if h_clean in _WEB_ORIGIN_HOSTS:
+            scheme = getattr(flow.request, "scheme", "") or "https"
+            return f"{scheme}://{h_clean}"
+    except Exception:
+        pass
+    return ""
+
+
+def _record_web_origin_from_flow(flow) -> str:
+    global _last_detected_web_origin
+    origin = _extract_web_origin_from_flow(flow)
+    if origin:
+        _last_detected_web_origin = origin
+    return origin
+
+
+def _pwa_asset_origin(flow=None, origin: str = "") -> str:
+    explicit = (origin or "").strip().rstrip("/")
+    if explicit.startswith(("http://", "https://")):
+        return explicit
+    from_flow = _extract_web_origin_from_flow(flow)
+    if from_flow:
+        return from_flow
     env = (os.environ.get("TBANKMITM_PWA_ORIGIN") or "").strip().rstrip("/")
     if env:
         return env
@@ -1043,10 +1098,12 @@ def _pwa_asset_origin() -> str:
         raw = (controller.config.get(key) or "").strip().rstrip("/")
         if raw:
             return raw
-    return "https://www.tbank-online.com"
+    if _last_detected_web_origin:
+        return _last_detected_web_origin
+    return "https://www.tbank.ru"
 
 
-def _app_served_bank_logo_url(logo: str) -> str:
+def _app_served_bank_logo_url(logo: str, flow=None, origin: str = "") -> str:
     """
     Лого как в панели: absolute https://…/__tbankmitm_panel/panel-bank-logo?u=…
     (относительный путь из JSON api.* часто даёт 404 на другом хосте).
@@ -1054,14 +1111,17 @@ def _app_served_bank_logo_url(logo: str) -> str:
     normalized = _normalize_logo_url(logo)
     if not normalized:
         return ""
+    resolved_origin = _pwa_asset_origin(flow=flow, origin=origin)
     if normalized.startswith("http://") or normalized.startswith("https://"):
         if "/panel-bank-logo?u=" in normalized:
+            idx = normalized.find(SAME_ORIGIN_PANEL_PREFIX)
+            if idx > 0:
+                return f"{resolved_origin}{normalized[idx:]}"
             return normalized
-    origin = _pwa_asset_origin()
     if normalized.startswith(SAME_ORIGIN_PANEL_PREFIX):
-        return f"{origin}{normalized}"
+        return f"{resolved_origin}{normalized}"
     path = f"{SAME_ORIGIN_PANEL_PREFIX}/panel-bank-logo?u={quote(normalized, safe='')}"
-    return f"{origin}{path}"
+    return f"{resolved_origin}{path}"
 
 
 def _normalize_logo_url(raw_logo):
@@ -1916,6 +1976,140 @@ def _apply_manual_transfer_feed_style(out: dict, typ: str, ms: int) -> None:
         out.pop("creditingTime", None)
 
 
+_TBANK_TRANSFER_PROVIDER_IDS = frozenset(
+    {
+        "p2p-anybank",
+        "transfer-sbp",
+        "transfer-bank",
+        "c2c-cardtoacc",
+        "c2c-anytoany",
+        "c2c-out",
+        "transfer-inner",
+        "transfer-by-phone",
+        "transfer-card",
+        "transfer-account",
+        "p2p-tbank",
+        "p2p-tinkoff",
+        "p2p-qr",
+        "sbp-transfer",
+    }
+)
+
+
+def extract_transfer_comment(op: dict) -> str:
+    """Извлекает комментарий перевода без смешивания с названием/получателем."""
+    if not isinstance(op, dict):
+        return ""
+    if "comment" in op:
+        return str(op.get("comment") or "").strip()
+
+    oid = str(op.get("id") or "").strip()
+    is_fake = (
+        oid.startswith("UNIFIED_")
+        or bool(op.get("fake_transfer"))
+        or str(op.get("merchantKey") or "").startswith("FAKE_SBP")
+        or ("receiver_name" in op)
+        or ("bank_receiver" in op)
+    )
+    if is_fake:
+        pay = op.get("payment")
+        if isinstance(pay, dict) and isinstance(pay.get("fieldsValues"), dict):
+            msg = pay["fieldsValues"].get("message")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()
+        for k in ("message", "nomination"):
+            v = op.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    # Legacy manual ops (m_*) created before explicit "comment" key existed:
+    # description used to store user comment when distinct from title and "Переводы".
+    title = str(op.get("title") or "").strip()
+    desc = str(op.get("description") or "").strip()
+    if title and desc and desc.lower() != title.lower() and desc.lower() != "переводы":
+        return desc
+    for k in ("message", "nomination"):
+        v = op.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def apply_transfer_comment_to_operation(
+    out: dict,
+    comment: str,
+    typ: str,
+    op_id: str = "",
+    provider_id: str = "p2p-anybank",
+    fields_extra: Optional[dict] = None,
+) -> dict:
+    """Применяет (или очищает) комментарий операции по строгой Valibot+Zod схеме Т-Банка."""
+    if not isinstance(out, dict):
+        return out
+    c = str(comment or "").strip()
+    typ_norm = "Credit" if str(typ or out.get("type") or out.get("operationType") or "Debit").strip() == "Credit" else "Debit"
+
+    if not c:
+        out.pop("message", None)
+        out.pop("nomination", None)
+        out.pop("comment", None)
+        pay = out.get("payment")
+        if isinstance(pay, dict):
+            fv = pay.get("fieldsValues")
+            if isinstance(fv, dict):
+                fv.pop("message", None)
+                clean_fv = {str(k): str(v) for k, v in fv.items() if v is not None}
+                pay["fieldsValues"] = clean_fv
+        return out
+
+    if typ_norm == "Credit":
+        out["nomination"] = c
+        out["message"] = c
+        return out
+
+    # Debit
+    out["message"] = c
+    existing_pay = out.get("payment") if isinstance(out.get("payment"), dict) else {}
+    pid_raw = str(provider_id or "").strip()
+    if pid_raw not in _TBANK_TRANSFER_PROVIDER_IDS:
+        existing_pid = str(existing_pay.get("providerId") or "").strip()
+        pid_raw = existing_pid if existing_pid in _TBANK_TRANSFER_PROVIDER_IDS else "p2p-anybank"
+
+    raw_op_id = str(op_id or out.get("id") or "").strip()
+    digits = re.sub(r"\D+", "", raw_op_id)
+    payment_id = str(existing_pay.get("paymentId") or "").strip() or digits or "1000001"
+    provider_group_id = str(existing_pay.get("providerGroupId") or "").strip() or "Переводы"
+    has_payment_order = existing_pay.get("hasPaymentOrder") if isinstance(existing_pay.get("hasPaymentOrder"), bool) else False
+    source_is_qr = existing_pay.get("sourceIsQr") if isinstance(existing_pay.get("sourceIsQr"), bool) else False
+    repeatable = existing_pay.get("repeatable") if isinstance(existing_pay.get("repeatable"), bool) else False
+
+    fv: dict[str, str] = {}
+    old_fv = existing_pay.get("fieldsValues")
+    if isinstance(old_fv, dict):
+        for k, v in old_fv.items():
+            if v is not None:
+                fv[str(k)] = str(v)
+    if isinstance(fields_extra, dict):
+        for k, v in fields_extra.items():
+            if v is not None:
+                sv = str(v).strip()
+                if sv:
+                    fv[str(k)] = sv
+    fv["message"] = c
+
+    out["payment"] = {
+        "paymentId": payment_id,
+        "providerId": pid_raw,
+        "providerGroupId": provider_group_id,
+        "hasPaymentOrder": has_payment_order,
+        "sourceIsQr": source_is_qr,
+        "repeatable": repeatable,
+        "fieldsValues": fv,
+    }
+    return out
+
+
 def overlay_manual_on_template(
     template,
     op_id,
@@ -1973,16 +2167,13 @@ def overlay_manual_on_template(
     if "merchantName" in out:
         out["merchantName"] = merchant_name
 
-    # Вторая строка / комментарий: только если пользователь ввёл; без текста по умолчанию
-    second_line = secondary if secondary else (user_desc if typ == "Debit" else "")
-    for key in ("description",):
-        if key in out:
-            out[key] = primary
-    for key in ("formattedDescription",):
-        if key in out:
-            out[key] = second_line
+    # Вторая строка: категория/подзаголовок («Переводы» по умолчанию); комментарий никогда не пишется в description/subtitle
+    second_line = secondary or "Переводы"
+    out["description"] = primary
+    if "formattedDescription" in out:
+        out["formattedDescription"] = second_line
     if "subtitle" in out:
-        out["subtitle"] = secondary or second_line
+        out["subtitle"] = second_line
 
     _sync_all_operation_times(out, ms)
 
@@ -2118,6 +2309,23 @@ def overlay_manual_on_template(
         _patch_feed_display_logo(out, brand_logo)
 
     _coerce_money_fields_in_operation(out)
+
+    comment_val = extract_transfer_comment(op)
+    fields_extra = {}
+    if phone:
+        fields_extra["pointer"] = phone
+    if primary:
+        fields_extra["maskedFIO"] = primary
+    if bank_label:
+        fields_extra["bank"] = bank_label
+    apply_transfer_comment_to_operation(
+        out,
+        comment_val,
+        typ,
+        op_id=str(op_id or ""),
+        provider_id=str(op.get("provider_id") or "p2p-anybank"),
+        fields_extra=fields_extra,
+    )
 
     return out
 
@@ -2583,6 +2791,25 @@ def _normalize_injected_fake_row(row: dict, ref: Optional[dict] = None) -> dict:
             if ref.get(k):
                 row[k] = ref[k]
     row["isInner"] = bool(_coerce_inner_flag(row)) if "is_inner" in row else False
+    comment_val = extract_transfer_comment(row)
+    fields_extra = {}
+    rp = str(row.get("receiver_phone") or row.get("requisite_phone") or row.get("phone") or "").strip()
+    if rp:
+        fields_extra["pointer"] = rp
+    rn = str(row.get("receiver_name") or row.get("description") or row.get("title") or "").strip()
+    if rn:
+        fields_extra["maskedFIO"] = rn
+    bn = str(row.get("bank_receiver") or row.get("bank") or "").strip()
+    if bn:
+        fields_extra["bank"] = bn
+    apply_transfer_comment_to_operation(
+        row,
+        comment_val,
+        typ,
+        op_id=str(row.get("id") or ""),
+        provider_id=str(row.get("provider_id") or "p2p-anybank"),
+        fields_extra=fields_extra,
+    )
     return row
 
 
@@ -3257,6 +3484,7 @@ def _fake_transfer_ops_for_panel(skip_ids: set, month_only: bool = True) -> list
                 "sender_name": rn,
                 "requisite_sender_name": rn,
                 "card_number": str(op.get("receiver_card") or op.get("card_number") or "").strip(),
+                "comment": extract_transfer_comment(op),
                 "manual": False,
                 "fake_transfer": True,
             })
@@ -3332,6 +3560,7 @@ def _receipt_fingerprint(op_data: dict) -> str:
         "type": op_data.get("type"),
         "phone": op_data.get("requisite_phone") or op_data.get("phone"),
         "sender": op_data.get("requisite_sender_name") or op_data.get("sender_name"),
+        "comment": str(op_data.get("comment") or op_data.get("message") or op_data.get("nomination") or "").strip(),
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -3394,6 +3623,7 @@ def _fake_history_op_to_receipt_dict(hop: dict) -> dict:
         "title": title,
         "requisite_phone": phone,
         "phone": phone,
+        "comment": extract_transfer_comment(hop),
     }
 
 
@@ -3449,6 +3679,7 @@ def ensure_operation_receipt_pdf_path(op_id: str) -> Optional[str]:
             "receipt_phone": op.get("receipt_phone") or "",
             "sender_name": op.get("sender_name") or "",
             "requisite_sender_name": op.get("requisite_sender_name") or op.get("sender_name") or "",
+            "comment": extract_transfer_comment(op),
         }
         fp = _receipt_fingerprint(op_data)
         pdf_abs = _resolve_stored_receipt_pdf(str(op.get("pdf_path") or ""))
@@ -3598,6 +3829,184 @@ def remove_fake_transfer_operation(op_id: str) -> bool:
                     print(f"[history] remove_fake_transfer_operation {path}: {e}")
     _clear_last_transfer_session_if_matches(oid)
     return changed or is_fake_transfer_deleted(oid)
+
+
+def update_fake_transfer_operation(op_id: str, body: dict) -> bool:
+    """Обновляет запись мок-перевода (UNIFIED_*) в last_transfer*.json, памяти transfer и чеке."""
+    oid = str(op_id or "").strip()
+    if not oid or not isinstance(body, dict):
+        return False
+    updated_any = False
+    updated_op_snapshot = None
+
+    for path in _last_transfer_json_paths():
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        fh = data.get("fake_history")
+        if not isinstance(fh, list):
+            continue
+        touched = False
+        for op in fh:
+            if not isinstance(op, dict) or str(op.get("id") or "") != oid:
+                continue
+            touched = True
+            op_type = str(op.get("type") or op.get("operationType") or "Debit").strip()
+            if "type" in body and body.get("type") in ("Credit", "Debit"):
+                op_type = body["type"]
+            elif "direction" in body:
+                op_type = "Debit" if body.get("direction") == "out" else "Credit"
+            op["type"] = op_type
+            op["operationType"] = op_type
+
+            if "amount" in body:
+                amt_raw = round(abs(float(body.get("amount") or 0)), 2)
+                amt_val = int(amt_raw) if abs(amt_raw - int(amt_raw)) < 1e-9 else amt_raw
+                rub_cur = _rub_currency_obj()
+                op["amount"] = {"value": amt_val, "currency": dict(rub_cur)}
+                op["accountAmount"] = {"value": amt_val, "currency": dict(rub_cur)}
+                op["signedAmount"] = {"value": -amt_val if op_type == "Debit" else amt_val, "currency": dict(rub_cur)}
+                op["debitAmount"] = {"value": amt_val if op_type == "Debit" else 0.0, "currency": dict(rub_cur)}
+                op["creditAmount"] = {"value": amt_val if op_type == "Credit" else 0.0, "currency": dict(rub_cur)}
+
+            if "title" in body:
+                t_val = str(body.get("title") or "").strip()
+                if t_val:
+                    op["receiver_name"] = t_val
+                    op["description"] = t_val
+                    op["title"] = t_val
+                    if isinstance(op.get("brand"), dict):
+                        op["brand"]["name"] = t_val
+                    ci = op.get("categoryInfo")
+                    if isinstance(ci, dict) and isinstance(ci.get("criteria"), dict) and isinstance(ci["criteria"].get("bulkVariety"), dict):
+                        ci["criteria"]["bulkVariety"]["value"] = t_val[:200]
+
+            if "subtitle" in body:
+                sub_val = str(body.get("subtitle") or "").strip()
+                op["subtitle"] = sub_val
+                if sub_val:
+                    op["subcategory"] = sub_val
+
+            if "bank" in body:
+                b_val = str(body.get("bank") or "").strip()
+                op["bank_receiver"] = b_val
+                op["bank"] = b_val
+                if b_val:
+                    if isinstance(op.get("merchant"), dict):
+                        op["merchant"]["name"] = b_val
+                    else:
+                        op["merchant"] = {"name": b_val}
+
+            for pk in ("requisite_phone", "phone"):
+                if pk in body:
+                    pval = str(body.get(pk) or "").strip()
+                    op["receiver_phone"] = pval
+                    op["requisite_phone"] = pval
+                    op["phone"] = pval
+
+            for sk in ("requisite_sender_name", "sender_name"):
+                if sk in body:
+                    sval = str(body.get(sk) or "").strip()
+                    op["sender_name"] = sval
+                    op["requisite_sender_name"] = sval
+
+            if "card_number" in body:
+                cval = str(body.get("card_number") or "").strip()
+                op["card_number"] = cval
+                op["receiver_card"] = cval
+
+            if body.get("datetime"):
+                dstr, op_ms = parse_panel_datetime_iso(body["datetime"])
+                op["date_full"] = dstr
+                op["date"] = dstr
+                _sync_all_operation_times(op, op_ms)
+                tblock = {"milliseconds": op_ms}
+                if op_type == "Credit":
+                    op["creditingTime"] = dict(tblock)
+                    op.pop("debitingTime", None)
+                else:
+                    op["debitingTime"] = dict(tblock)
+                    op.pop("creditingTime", None)
+
+            if "comment" in body:
+                comment_val = str(body.get("comment") or "").strip()
+                op["comment"] = comment_val
+            elif "description" in body:
+                desc_cand = str(body.get("description") or "").strip()
+                rec_name = str(op.get("receiver_name") or op.get("title") or "").strip()
+                if desc_cand != rec_name:
+                    op["comment"] = desc_cand
+
+            comment_cur = extract_transfer_comment(op)
+            fields_extra = {}
+            rp = str(op.get("receiver_phone") or op.get("requisite_phone") or op.get("phone") or "").strip()
+            if rp:
+                fields_extra["pointer"] = rp
+            rn = str(op.get("receiver_name") or op.get("title") or op.get("description") or "").strip()
+            if rn:
+                fields_extra["maskedFIO"] = rn
+            bn = str(op.get("bank_receiver") or op.get("bank") or "").strip()
+            if bn:
+                fields_extra["bank"] = bn
+            apply_transfer_comment_to_operation(
+                op,
+                comment_cur,
+                op_type,
+                op_id=oid,
+                provider_id=str(op.get("provider_id") or "p2p-anybank"),
+                fields_extra=fields_extra,
+            )
+            op["comment"] = comment_cur
+
+            _invalidate_manual_receipt(op)
+            if str(data.get("transaction_id") or "") == oid and "comment" in body:
+                data["comment"] = comment_cur
+            updated_op_snapshot = copy.deepcopy(op)
+            break
+
+        if touched:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                updated_any = True
+            except Exception as e:
+                if bank_debug_enabled():
+                    print(f"[history] update_fake_transfer_operation {path}: {e}")
+
+    if updated_any and updated_op_snapshot is not None:
+        if oid in operations_cache and isinstance(operations_cache[oid], dict):
+            operations_cache[oid]["amount"] = get_op_amount(updated_op_snapshot)
+            operations_cache[oid]["type"] = updated_op_snapshot.get("type") or "Debit"
+            operations_cache[oid]["date"] = updated_op_snapshot.get("date_full") or updated_op_snapshot.get("date") or operations_cache[oid].get("date", "")
+            operations_cache[oid]["description"] = updated_op_snapshot.get("description") or operations_cache[oid].get("description", "")
+            operations_cache[oid]["bank"] = _fake_bank_display_name(updated_op_snapshot) or operations_cache[oid].get("bank", "")
+        tr_mod = sys.modules.get("transfer")
+        if tr_mod is not None:
+            try:
+                td = getattr(tr_mod, "transfer_data", None)
+                if isinstance(td, dict) and isinstance(td.get("fake_history"), list):
+                    for idx, item in enumerate(td["fake_history"]):
+                        if isinstance(item, dict) and str(item.get("id") or "") == oid:
+                            td["fake_history"][idx] = copy.deepcopy(updated_op_snapshot)
+                            break
+                    if str(td.get("transaction_id") or "") == oid:
+                        td["comment"] = extract_transfer_comment(updated_op_snapshot)
+                        td.pop("last_pdf_path", None)
+                    tr_mod.fake_history = td["fake_history"]
+            except Exception:
+                pass
+        try:
+            ensure_operation_receipt_pdf_path(oid)
+        except Exception:
+            pass
+
+    return updated_any
 
 
 def extract_operations(data):
@@ -4541,7 +4950,7 @@ def generate_statement_pdf_for_period(date_from: str, date_to: str) -> Optional[
     return path, fname
 
 
-def build_operations_api_response():
+def build_operations_api_response(compact: bool = False):
     """Единый JSON для GET /api/operations (mitm и отдельный run.py / panel_server)."""
     ensure_manual_operations_fresh()
     global last_sync_time
@@ -4554,6 +4963,17 @@ def build_operations_api_response():
             continue
         if not show_all and not is_current_month(op.get("date", "")):
             continue
+        fh = _fake_history_record_by_id(str(op_id))
+        if compact and not (fh and (show_all or _fake_op_in_current_month(fh))):
+            month_ops.append({
+                "id": op_id,
+                "date": op.get("date", ""),
+                "sort_ts": date_str_to_millis(op.get("date", "")),
+                "amount": op.get("amount", 0),
+                "type": op.get("type", ""),
+                "manual": False,
+            })
+            continue
         row = {
             "id": op_id,
             "date": op.get("date", ""),
@@ -4564,7 +4984,6 @@ def build_operations_api_response():
             "bank": op.get("bank", ""),
             "manual": False,
         }
-        fh = _fake_history_record_by_id(str(op_id))
         if fh and (show_all or _fake_op_in_current_month(fh)):
             row["fake_transfer"] = True
             rp = str(fh.get("receiver_phone") or fh.get("requisite_phone") or "").strip()
@@ -4573,6 +4992,7 @@ def build_operations_api_response():
             row["title"] = str(fh.get("title") or row["desc"] or "").strip()
             row["subtitle"] = str(fh.get("subcategory") or "").strip()
             row["description"] = str(fh.get("description") or "").strip()
+            row["comment"] = extract_transfer_comment(fh)
             row["sender_name"] = rn
             row["requisite_sender_name"] = rn
             row["phone"] = rp
@@ -4606,6 +5026,7 @@ def build_operations_api_response():
             "title": op.get("title") or "",
             "subtitle": op.get("subtitle") or "",
             "description": op.get("description") or "",
+            "comment": extract_transfer_comment(op),
             "sender_name": op.get("sender_name") or "",
             "requisite_sender_name": op.get("requisite_sender_name") or op.get("sender_name") or "",
             "bank": op.get("bank", ""),
@@ -4653,15 +5074,17 @@ def response(flow: http.HTTPFlow) -> None:
         return
     if not flow.response:
         return
+    _record_web_origin_from_flow(flow)
+    if callable(_is_telemetry_or_log_url) and _is_telemetry_or_log_url(url):
+        return
+    if url_prohibit_proxy_json_mutation(url):
+        return
     ensure_response_decoded(flow)
     if not flow.response.text:
         if bank_debug_enabled():
             print(f"[history] пустой ответ: {url[:120]}")
         return
     if not is_jsonish_response(flow):
-        return
-
-    if url_prohibit_proxy_json_mutation(url):
         return
 
     try:
@@ -4787,6 +5210,7 @@ def response(flow: http.HTTPFlow) -> None:
 def request(flow: http.HTTPFlow) -> None:
     global hidden_operations, last_sync_time
     ensure_manual_operations_fresh()
+    _record_web_origin_from_flow(flow)
 
     if flow.request and is_bank_flow(flow):
         _p_low = (flow.request.path or "").split("?", 1)[0].lower()
@@ -4935,7 +5359,9 @@ def request(flow: http.HTTPFlow) -> None:
         return
 
     if path_only == "/api/operations" and flow.request.method == "GET":
-        response_data = build_operations_api_response()
+        qs_ops = parse_qs(urlparse(path).query)
+        compact_flag = (qs_ops.get("compact") or ["0"])[0].strip().lower() in ("1", "true", "yes")
+        response_data = build_operations_api_response(compact=compact_flag)
         flow.response = http.Response.make(
             200,
             json.dumps(response_data, ensure_ascii=False).encode('utf-8'),
@@ -4965,6 +5391,10 @@ def request(flow: http.HTTPFlow) -> None:
             amount = abs(float(body.get("amount") or 0))
             bank = (body.get("bank") or "").strip()
             desc = (body.get("description") or "").strip()
+            if "comment" in body:
+                comment_val = str(body.get("comment") or "").strip()
+            else:
+                comment_val = desc
             title = (body.get("title") or body.get("phone") or "").strip()
             subtitle = (body.get("subtitle") or "").strip()
             sender_name = (body.get("sender_name") or "").strip()
@@ -4983,6 +5413,7 @@ def request(flow: http.HTTPFlow) -> None:
                 "amount": amount,
                 "type": op_type,
                 "description": desc,
+                "comment": comment_val,
                 "bank": bank,
                 "title": title,
                 "subtitle": subtitle,
@@ -5013,6 +5444,7 @@ def request(flow: http.HTTPFlow) -> None:
                     "receipt_phone": manual_operations[op_id].get("receipt_phone") or "",
                     "sender_name": sender_name,
                     "requisite_sender_name": requisite_sender_name,
+                    "comment": comment_val,
                 }
                 receipt_path = func.generate_operation_receipt(op_data)
                 if receipt_path:
@@ -5085,36 +5517,57 @@ def request(flow: http.HTTPFlow) -> None:
         try:
             body = json.loads(flow.request.text or "{}")
             op_id = (body.get("id") or "").strip()
-            if not op_id or op_id not in manual_operations:
+            if not op_id:
                 flow.response = http.Response.make(
                     404,
                     json.dumps({"error": "not found"}, ensure_ascii=False).encode("utf-8"),
                     {"Content-Type": "application/json"},
                 )
                 return
-            rec = manual_operations[op_id]
-            if "amount" in body:
-                rec["amount"] = abs(float(body.get("amount") or 0))
-            if "type" in body and body.get("type") in ("Credit", "Debit"):
-                rec["type"] = body["type"]
-            if "direction" in body:
-                rec["type"] = "Debit" if body.get("direction") == "out" else "Credit"
-            for k in ("title", "subtitle", "description", "bank", "bank_preset", "phone", "card_number", "sender_name", "requisite_phone", "requisite_sender_name", "receipt_phone"):
-                if k in body:
-                    rec[k] = (body.get(k) or "").strip() if isinstance(body.get(k), str) else body.get(k)
-            if body.get("datetime"):
-                dstr, op_ms = parse_panel_datetime_iso(body["datetime"])
-                rec["date"] = dstr
-                rec["operationTime"] = {"milliseconds": op_ms, "seconds": op_ms / 1000.0}
-            _invalidate_manual_receipt(rec)
-            save_manual_operations()
-            sync_panel_income_expense_with_operations()
-            flow.response = http.Response.make(
-                200,
-                json.dumps({"status": "ok", "id": op_id}, ensure_ascii=False).encode("utf-8"),
-                {"Content-Type": "application/json"},
-            )
-            print(f"[history] Обновлена ручная операция {op_id}")
+            if op_id in manual_operations:
+                rec = manual_operations[op_id]
+                if "amount" in body:
+                    rec["amount"] = abs(float(body.get("amount") or 0))
+                if "type" in body and body.get("type") in ("Credit", "Debit"):
+                    rec["type"] = body["type"]
+                if "direction" in body:
+                    rec["type"] = "Debit" if body.get("direction") == "out" else "Credit"
+                for k in ("title", "subtitle", "description", "comment", "bank", "bank_preset", "phone", "card_number", "sender_name", "requisite_phone", "requisite_sender_name", "receipt_phone"):
+                    if k in body:
+                        rec[k] = (body.get(k) or "").strip() if isinstance(body.get(k), str) else body.get(k)
+                if "comment" not in body and "description" in body:
+                    rec["comment"] = str(body.get("description") or "").strip()
+                if body.get("datetime"):
+                    dstr, op_ms = parse_panel_datetime_iso(body["datetime"])
+                    rec["date"] = dstr
+                    rec["operationTime"] = {"milliseconds": op_ms, "seconds": op_ms / 1000.0}
+                _invalidate_manual_receipt(rec)
+                save_manual_operations()
+                try:
+                    ensure_operation_receipt_pdf_path(op_id)
+                except Exception:
+                    pass
+                sync_panel_income_expense_with_operations()
+                flow.response = http.Response.make(
+                    200,
+                    json.dumps({"status": "ok", "id": op_id}, ensure_ascii=False).encode("utf-8"),
+                    {"Content-Type": "application/json"},
+                )
+                print(f"[history] Обновлена ручная операция {op_id}")
+            elif update_fake_transfer_operation(op_id, body):
+                sync_panel_income_expense_with_operations()
+                flow.response = http.Response.make(
+                    200,
+                    json.dumps({"status": "ok", "id": op_id}, ensure_ascii=False).encode("utf-8"),
+                    {"Content-Type": "application/json"},
+                )
+                print(f"[history] Обновлена операция мок-перевода {op_id}")
+            else:
+                flow.response = http.Response.make(
+                    404,
+                    json.dumps({"error": "not found"}, ensure_ascii=False).encode("utf-8"),
+                    {"Content-Type": "application/json"},
+                )
         except Exception as e:
             flow.response = http.Response.make(
                 400,

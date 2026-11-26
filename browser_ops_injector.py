@@ -81,6 +81,19 @@ def _extract_op_ms(op: dict) -> int:
     return 0
 
 
+def _extract_comment_for_manual(op: dict) -> str:
+    fn = getattr(history, "extract_transfer_comment", None)
+    if callable(fn):
+        return (fn(op) or "").strip()
+    if "comment" in op:
+        return str(op.get("comment") or "").strip()
+    title = str(op.get("title") or "").strip()
+    desc = str(op.get("description") or "").strip()
+    if title and desc and desc.lower() != title.lower() and desc.lower() != "переводы":
+        return desc
+    return ""
+
+
 def _manual_ops_payload():
     history.ensure_manual_operations_fresh()
     show_all = history.app_include_all_operations()
@@ -100,6 +113,7 @@ def _manual_ops_payload():
             "title": op.get("title") or "",
             "subtitle": op.get("subtitle") or "",
             "description": op.get("description") or "",
+            "comment": _extract_comment_for_manual(op),
             "bank": op.get("bank") or "",
             "bank_preset": (op.get("bank_preset") or "custom").lower(),
             "logo": (op.get("logo") or "").strip(),
@@ -137,6 +151,7 @@ def _manual_ops_payload():
             "title": row.get("title") or row.get("desc") or "",
             "subtitle": row.get("subtitle") or "",
             "description": row.get("description") or "",
+            "comment": str(row.get("comment") or "").strip(),
             "bank": row.get("bank") or "",
             "bank_preset": (row.get("bank_preset") or "sbp").lower(),
             "logo": (row.get("logo") or "").strip(),
@@ -171,6 +186,7 @@ def _detail_ops_by_id_payload() -> dict:
             "type": op.get("type") or "Debit",
             "title": (op.get("title") or "").strip(),
             "description": (op.get("description") or "").strip(),
+            "comment": _extract_comment_for_manual(op),
             "requisite_phone": (op.get("requisite_phone") or op.get("phone") or "").strip(),
             "phone": (op.get("phone") or "").strip(),
             "requisite_sender_name": (op.get("requisite_sender_name") or op.get("sender_name") or "").strip(),
@@ -189,6 +205,7 @@ def _detail_ops_by_id_payload() -> dict:
             "type": row.get("type") or "Debit",
             "title": (row.get("title") or row.get("desc") or "").strip(),
             "description": (row.get("description") or "").strip(),
+            "comment": str(row.get("comment") or "").strip(),
             "requisite_phone": (row.get("requisite_phone") or row.get("phone") or "").strip(),
             "phone": (row.get("phone") or "").strip(),
             "requisite_sender_name": (row.get("requisite_sender_name") or row.get("sender_name") or "").strip(),
@@ -352,13 +369,12 @@ def _build_script() -> str:
           }}).catch(noop)
         );
       }}
-      if (hadController) {{
+      if (hadController || hadRegs) {{
         Promise.all(tasks).finally(function () {{
-          if (!hadController && !hadRegs) return;
           try {{
             const k = '__tbank_mitm_sw_reload_ts';
             const last = Number(sessionStorage.getItem(k) || '0');
-            if (last && (Date.now() - last) < 10000) return;
+            if (last && (Date.now() - last) < 15000) return;
             sessionStorage.setItem(k, String(Date.now()));
           }} catch (_) {{}}
           try {{ location.reload(); }} catch (_) {{}}
@@ -684,6 +700,7 @@ def _build_script() -> str:
     document.querySelectorAll('[data-manual-pumba-operation="1"]').forEach(function (n) {{ n.remove(); }});
     document.querySelectorAll('[data-manual-bank-wrapper="1"]').forEach(function (n) {{ n.remove(); }});
     document.querySelectorAll('[data-manual-actions-wrapper="1"]').forEach(function (n) {{ n.remove(); }});
+    document.querySelectorAll('[data-manual-comment-bubble="1"]').forEach(function (n) {{ n.remove(); }});
     document.querySelectorAll('[data-panel-manual-black-card="1"]').forEach(function (n) {{
       n.removeAttribute('data-panel-manual-black-card');
     }});
@@ -1733,7 +1750,7 @@ def _build_script() -> str:
     __finCardInFlight = true;
     const done = function () {{ __finCardInFlight = false; }};
     if (isMybankRootPath()) {{
-      fetchJsonFirstOk(_panelUrlVariants(PANEL_OPERATIONS_URL))
+      fetchJsonFirstOk(_panelUrlVariants(PANEL_OPERATIONS_URL + '?compact=1'))
         .then(function (d) {{
           const t = finTotalsForMybankHomeFromOperationsApi(d);
           if (t) {{
@@ -3097,25 +3114,30 @@ def _build_script() -> str:
   }}
 
   function appLogoUrl(url) {{
-    const raw = String(url || '').trim();
+    let raw = String(url || '').trim();
     if (!raw) return '';
-    if (raw.indexOf('/panel-bank-logo?u=') !== -1 && raw.indexOf('http') === 0) return raw;
-    const proxied = toImgproxy(raw.indexOf('/panel-bank-logo?u=') !== -1 ? (function() {{
+    if (raw.indexOf('/panel-bank-logo?u=') !== -1) {{
       try {{
         const q = raw.indexOf('?u=');
-        if (q >= 0) return decodeURIComponent(raw.slice(q + 3).split('&')[0]);
+        if (q >= 0) raw = decodeURIComponent(raw.slice(q + 3).split('&')[0]);
       }} catch (_) {{}}
-      return raw;
-    }})() : raw);
+    }}
+    const proxied = toImgproxy(raw);
     if (!proxied) return '';
-    const path = '/__tbankmitm_panel/panel-bank-logo?u=' + encodeURIComponent(proxied);
     try {{
       const h = String(location.hostname || '').toLowerCase();
-      if (location.protocol === 'https:' && (h.indexOf('tbank-online.com') !== -1 || h.endsWith('tbank.ru') || h.indexOf('tinkoff.ru') !== -1)) {{
+      const isTbankOnline = h.indexOf('tbank-online.com') !== -1;
+      const isDirectTbankCdn = /^https:\\/\\/(?:imgproxy\\.cdn-tinkoff\\.ru|brands-prod\\.cdn-tinkoff\\.ru|brands-static\\.cdn-tinkoff\\.ru|bms-logo-prod\\.t-static\\.ru|cdn\\.tbank\\.ru|acdn\\.tinkoff\\.ru|static\\.tbank\\.ru|static\\.tinkoff\\.ru|sso-forms-prod\\.t-static\\.ru)\\//i.test(proxied);
+      if (!isTbankOnline && isDirectTbankCdn) {{
+        return proxied;
+      }}
+      const path = '/__tbankmitm_panel/panel-bank-logo?u=' + encodeURIComponent(proxied);
+      if (location.protocol === 'https:' && (isTbankOnline || h.endsWith('tbank.ru') || h.indexOf('tinkoff.ru') !== -1)) {{
         return String(location.origin).replace(/\\/$/, '') + path;
       }}
+      return path;
     }} catch (_) {{}}
-    return path;
+    return '/__tbankmitm_panel/panel-bank-logo?u=' + encodeURIComponent(proxied);
   }}
 
   function presetMeta(key) {{
@@ -3232,6 +3254,8 @@ def _build_script() -> str:
     const amt = Math.abs(Number(op.amount || 0));
     const preset = presetMeta(op.bank_preset || 'custom');
     const primary = String(op.title || op.description || op.phone || (typ === 'Debit' ? 'Перевод' : 'Поступление')).trim();
+    const secondary = String((op && op.subtitle) || '').trim() || 'Переводы';
+    const comment = String((op && op.comment) || '').trim();
     const bankName = String(op.bank || preset.name || 'Переводы').trim();
     const logo = appLogoUrl(
       (op.app_logo || '').trim() || op.logo || preset.logo || presetMeta('sbp').logo || ''
@@ -3245,12 +3269,13 @@ def _build_script() -> str:
     const signed = typ === 'Debit' ? -amt : amt;
 
     out.id = op.id;
+    out.description = primary;
     if ('type' in out) out.type = typ;
     if ('operationType' in out) out.operationType = typ;
     if ('title' in out) out.title = primary;
     if ('name' in out) out.name = primary;
-    if ('subtitle' in out) out.subtitle = 'Переводы';
-    if ('formattedDescription' in out) out.formattedDescription = 'Переводы';
+    if ('subtitle' in out) out.subtitle = secondary;
+    if ('formattedDescription' in out) out.formattedDescription = secondary;
     if ('merchantName' in out) out.merchantName = bankName;
 
     setMoney(out, 'amount', amt);
@@ -3367,6 +3392,36 @@ def _build_script() -> str:
       out.icon = logo;
     }}
     setLogo(out, logo);
+    if (!comment) {{
+      delete out.message;
+      delete out.nomination;
+      delete out.comment;
+      if (out.payment && out.payment.fieldsValues && typeof out.payment.fieldsValues === 'object') {{
+        delete out.payment.fieldsValues.message;
+      }}
+    }} else if (typ === 'Debit') {{
+      const prevFv = (out.payment && out.payment.fieldsValues && typeof out.payment.fieldsValues === 'object') ? out.payment.fieldsValues : {{}};
+      const cleanFv = {{}};
+      Object.keys(prevFv).forEach(function (fk) {{
+        const fvVal = prevFv[fk];
+        if (fvVal !== null && fvVal !== undefined) cleanFv[fk] = String(fvVal);
+      }});
+      cleanFv.message = comment;
+      out.message = comment;
+      delete out.nomination;
+      out.payment = {{
+        paymentId: String((out.payment && out.payment.paymentId) || String(op.id || '').replace(/\\D+/g, '') || '1000001'),
+        providerId: String((out.payment && out.payment.providerId) || 'p2p-anybank'),
+        providerGroupId: 'Переводы',
+        hasPaymentOrder: false,
+        sourceIsQr: false,
+        repeatable: false,
+        fieldsValues: cleanFv
+      }};
+    }} else {{
+      out.nomination = comment;
+      out.message = comment;
+    }}
     return out;
   }}
 
@@ -3634,6 +3689,11 @@ def _build_script() -> str:
         if (!enriched.logo && prev && prev.logo) enriched.logo = prev.logo;
         if (!enriched.logo && !enriched.app_logo && pm && pm.logo) enriched.logo = pm.logo;
         if (!enriched.title && row.desc) enriched.title = row.desc;
+        if (row.comment !== undefined && row.comment !== null) {{
+          enriched.comment = String(row.comment).trim();
+        }} else if (prev && prev.comment !== undefined && prev.comment !== null) {{
+          enriched.comment = String(prev.comment).trim();
+        }}
         if (!seenManualIds.has(idStr)) {{
           seenManualIds.add(idStr);
           nextManual.push(enriched);
@@ -3657,7 +3717,7 @@ def _build_script() -> str:
     if (!force && (now - __TBANK_DAY_OPS_FETCH_TS < 1500 || __TBANK_DAY_OPS_IN_FLIGHT)) return;
     __TBANK_DAY_OPS_FETCH_TS = now;
     __TBANK_DAY_OPS_IN_FLIGHT = true;
-    fetchJsonFirstOk(_panelUrlVariants(PANEL_OPERATIONS_URL))
+    fetchJsonFirstOk(_panelUrlVariants(PANEL_OPERATIONS_URL + '?compact=1'))
       .then(function (data) {{ applyLivePanelOperationsPayload(data); }})
       .catch(function () {{}})
       .finally(function () {{ __TBANK_DAY_OPS_IN_FLIGHT = false; }});
@@ -4130,7 +4190,7 @@ def _build_script() -> str:
     if (!opId || !PANEL_ORIGIN) return;
     if (__detailPanelFetchFor === opId) return;
     __detailPanelFetchFor = opId;
-    fetchJsonFirstOk(_panelUrlVariants(PANEL_ORIGIN + '/api/operations'))
+    fetchJsonFirstOk(_panelUrlVariants(PANEL_ORIGIN + '/api/operations?compact=1'))
       .then(function (data) {{
         const list = (data && data.operations) || [];
         let row = list.find(function (x) {{ return x && String(x.id) === String(opId); }});
@@ -4165,6 +4225,7 @@ def _build_script() -> str:
             type: row.type || 'Debit',
             title: String(row.title || row.desc || '').trim(),
             description: String(row.description || '').trim(),
+            comment: String(row.comment || '').trim(),
             requisite_phone: String(row.requisite_phone || row.phone || '').trim(),
             phone: String(row.phone || '').trim(),
             requisite_sender_name: String(row.requisite_sender_name || row.sender_name || '').trim(),
@@ -4400,7 +4461,7 @@ def _build_script() -> str:
   }}
 
   function openReceiptForLatestMockTransfer() {{
-    fetchJsonFirstOk(_panelUrlVariants(PANEL_ORIGIN + '/api/operations'))
+    fetchJsonFirstOk(_panelUrlVariants(PANEL_ORIGIN + '/api/operations?compact=1'))
       .then(function (d) {{
         const ops = (d && d.operations) || [];
         for (let i = 0; i < ops.length; i++) {{
@@ -5270,6 +5331,56 @@ def _build_script() -> str:
     return true;
   }}
 
+  function syncDetailCommentBubble(op) {{
+    const details = getOperationDetailsContainer();
+    if (!details) return;
+    const comment = String((op && op.comment) || '').trim();
+    const manualBubbles = details.querySelectorAll('[data-manual-comment-bubble="1"]');
+    if (!comment) {{
+      manualBubbles.forEach(function (n) {{ try {{ n.remove(); }} catch (_) {{}} }});
+      return;
+    }}
+    const normComment = normalizeUiText(comment).replace(/\\u00a0/g, ' ').trim();
+    let hasNativeBubble = !!details.querySelector('[data-qa-type="tui/message-bubble"]:not([data-manual-comment-bubble="1"])');
+    if (!hasNativeBubble && normComment) {{
+      const candidates = details.querySelectorAll('span, div, p');
+      for (let i = 0; i < candidates.length; i++) {{
+        const el = candidates[i];
+        if (!el || el.children.length > 0) continue;
+        if (el.closest('[data-manual-comment-bubble="1"]')) continue;
+        if (el.closest('[data-manual-requisites-panel="1"], [data-qa-type="visible-requisites"], [data-qa-type="mobile-pumba-account-operation"], [data-qa-type="mobile-pumba-actions-operation"]')) continue;
+        if (el.closest('h1, h2, [data-qa-type="tui/header.title"], [data-qa-type="atom-sensitive"], [data-qa-type="uikit/money"]')) continue;
+        const txt = normalizeUiText(el.textContent || '').replace(/\\u00a0/g, ' ').trim();
+        if (txt === normComment) {{
+          hasNativeBubble = true;
+          break;
+        }}
+      }}
+    }}
+    if (hasNativeBubble) {{
+      manualBubbles.forEach(function (n) {{ try {{ n.remove(); }} catch (_) {{}} }});
+      return;
+    }}
+    let bubble = manualBubbles[0] || null;
+    for (let i = 1; i < manualBubbles.length; i++) {{
+      try {{ manualBubbles[i].remove(); }} catch (_) {{}}
+    }}
+    if (!bubble) {{
+      bubble = document.createElement('div');
+      bubble.setAttribute('data-qa-type', 'tui/message-bubble');
+      bubble.setAttribute('data-manual-comment-bubble', '1');
+      bubble.style.cssText = 'margin:12px auto 4px;max-width:85%;padding:8px 14px;border-radius:14px;background:var(--tui-background-neutral-1,rgba(255,255,255,0.08));color:var(--tui-text-primary,#f6f7f8);font:var(--tui-typography-body-s,400 13px/1.38 Roboto,sans-serif);text-align:center;word-break:break-word;';
+      const hero = details.querySelector('[data-qa-type="tui/block-details"]');
+      const heroRow = directChildOfDetail(hero, details);
+      if (heroRow && heroRow.parentElement) {{
+        heroRow.parentElement.insertBefore(bubble, heroRow.nextSibling);
+      }} else {{
+        details.appendChild(bubble);
+      }}
+    }}
+    if (bubble.textContent !== comment) bubble.textContent = comment;
+  }}
+
   function patchDetailDom() {{
     if (!shouldPatchOperationsDetail()) return;
     injectManualDetailStyles();
@@ -5352,6 +5463,7 @@ def _build_script() -> str:
     ensureManualRequisitesPanel(op);
     patchDetailHeaderAmount(op);
     patchDetailHeaderTime(op);
+    syncDetailCommentBubble(op);
     dedupeDetailAccountCards();
     dedupeDetailRequisitesBlocks();
     canonicalizeDetailActionHosts(op);
@@ -5766,10 +5878,27 @@ def _is_same_origin_panel_flow(flow: http.HTTPFlow) -> bool:
     return "/__tbankmitm_panel" in url
 
 
+def _is_auth_or_login_flow(flow: http.HTTPFlow) -> bool:
+    try:
+        host = (getattr(flow.request, "host", "") or "").lower().strip()
+        if not host:
+            host = (flow.request.headers.get("Host") or flow.request.headers.get("host") or "").split(":")[0].lower().strip()
+        path = (flow.request.path or "").split("?", 1)[0].lower()
+        if host == "id.tbank.ru" or host.endswith(".id.tbank.ru"):
+            return True
+        if path == "/auth" or path.startswith("/auth/"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def request(flow: http.HTTPFlow) -> None:
     if not flow.request or not is_bank_flow(flow):
         return
     if _is_same_origin_panel_flow(flow):
+        return
+    if _is_auth_or_login_flow(flow):
         return
     path = (flow.request.path or "").split("?", 1)[0].lower()
 
@@ -5797,7 +5926,7 @@ def request(flow: http.HTTPFlow) -> None:
     is_html_nav = (
         sec_dest in ("document", "iframe")
         or ("text/html" in accept and not is_static_asset)
-        or (not is_static_asset and (path == "/" or path.startswith("/mybank") or path.startswith("/auth")))
+        or (not is_static_asset and (path == "/" or path.startswith("/mybank")))
     )
     if is_html_nav and not ("/mybank/statements" in path or "mybank%2fstatements" in path):
         flow.request.headers.pop("If-None-Match", None)
@@ -5813,6 +5942,8 @@ def response(flow: http.HTTPFlow) -> None:
     if not flow.response:
         return
     if _is_same_origin_panel_flow(flow):
+        return
+    if _is_auth_or_login_flow(flow):
         return
     url = (flow.request.pretty_url or "").lower()
     path = (flow.request.path or "").split("?", 1)[0].lower()

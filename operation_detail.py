@@ -13,6 +13,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import history
 import controller
+import bank_filter as _bank_filter_mod
 from bank_filter import (
     is_bank_flow,
     ensure_response_decoded,
@@ -21,11 +22,12 @@ from bank_filter import (
     flow_statements_spravki_context,
     url_prohibit_proxy_json_mutation,
 )
+_is_telemetry_or_log_url = getattr(_bank_filter_mod, "is_telemetry_or_log_url", None)
 
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
 )
-_MANUAL_RE = re.compile(r"\bm_[a-zA-Z0-9_]+\b")
+_MANUAL_RE = re.compile(r"\b(?:m|UNIFIED)_[a-zA-Z0-9_]+\b")
 
 def _format_phone_ru(phone: str) -> str:
     digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
@@ -46,7 +48,7 @@ def _extract_ids_from_url(url: str) -> list:
         q = parse_qs(urlparse(url).query)
         for key in ("operationId", "operation_id", "id", "operationID", "parentOperationId", "rootOperationId"):
             for val in q.get(key, []):
-                if val and (val.startswith("m_") or len(val) > 10):
+                if val and (val.startswith(("m_", "UNIFIED_")) or len(val) > 10):
                     out.append(val.strip())
     except Exception:
         pass
@@ -57,13 +59,84 @@ def _collect_ids_from_json(obj, out: set) -> None:
     if isinstance(obj, dict):
         for k in ("id", "operationId", "parentOperationId", "rootOperationId"):
             v = obj.get(k)
-            if isinstance(v, str) and (v.startswith("m_") or _UUID_RE.fullmatch(v)):
+            if isinstance(v, str) and (v.startswith(("m_", "UNIFIED_")) or _UUID_RE.fullmatch(v)):
                 out.add(v)
         for v in obj.values():
             _collect_ids_from_json(v, out)
     elif isinstance(obj, list):
         for x in obj:
             _collect_ids_from_json(x, out)
+
+
+def _fake_op_to_manual_shape(hop: dict) -> dict:
+    """Преобразует запись fake_history (UNIFIED_*) к единому формату для detail-патчинга."""
+    oid = str(hop.get("id") or "").strip()
+    amt_raw = hop.get("amount")
+    if isinstance(amt_raw, dict):
+        amt = abs(float(amt_raw.get("value") or 0))
+    else:
+        amt = abs(float(amt_raw or 0))
+    typ = str(hop.get("type") or hop.get("operationType") or "Debit").strip()
+    if typ not in ("Credit", "Debit"):
+        typ = "Debit"
+    date_s = (hop.get("date_full") or hop.get("date") or "").strip()
+    ot = hop.get("operationTime")
+    if not date_s and isinstance(ot, dict) and ot.get("milliseconds"):
+        try:
+            date_s = history.millis_to_bank_date_str(int(ot["milliseconds"]))
+        except Exception:
+            date_s = ""
+    title = str(hop.get("receiver_name") or hop.get("title") or hop.get("description") or "").strip()
+    if not title:
+        title = "Операция" if typ == "Debit" else "Поступление"
+    raw_sub = str(hop.get("subtitle") or "").strip()
+    subtitle = raw_sub if raw_sub and raw_sub != title else "Переводы"
+    bank = str(hop.get("bank_receiver") or hop.get("bank") or (hop.get("brand") or {}).get("name") or "").strip()
+    phone = str(hop.get("receiver_phone") or hop.get("requisite_phone") or hop.get("phone") or "").strip()
+    sender_name = str(hop.get("sender_name") or hop.get("requisite_sender_name") or "").strip()
+    card_number = str(hop.get("receiver_card") or hop.get("card_number") or "").strip()
+    pay = hop.get("payment") if isinstance(hop.get("payment"), dict) else {}
+    provider_id = str(hop.get("provider_id") or pay.get("providerId") or "p2p-anybank").strip() or "p2p-anybank"
+    logo = str(hop.get("bank_logo") or hop.get("merchant_logo") or (hop.get("brand") or {}).get("logo") or "").strip()
+    return {
+        "id": oid,
+        "date": date_s,
+        "operationTime": ot if isinstance(ot, dict) else None,
+        "amount": amt,
+        "type": typ,
+        "title": title,
+        "subtitle": subtitle,
+        "description": title,
+        "comment": history.extract_transfer_comment(hop),
+        "bank": bank,
+        "bank_preset": history._guess_bank_preset_key(bank) if hasattr(history, "_guess_bank_preset_key") else "sbp",
+        "logo": logo,
+        "phone": phone,
+        "requisite_phone": phone,
+        "sender_name": sender_name,
+        "requisite_sender_name": sender_name,
+        "card_number": card_number,
+        "provider_id": provider_id,
+        "fake_transfer": True,
+    }
+
+
+def _collect_synthetic_ops_map() -> dict[str, dict]:
+    """Объединяет manual_operations (m_*) и активные fake_history (UNIFIED_*)."""
+    out: dict[str, dict] = {}
+    for oid, op in (history.manual_operations or {}).items():
+        if oid and isinstance(op, dict):
+            out[str(oid)] = op
+    try:
+        for hop in history.pending_fake_history_ops(month_restrict=False):
+            if not isinstance(hop, dict):
+                continue
+            oid = str(hop.get("id") or "").strip()
+            if oid and oid not in out:
+                out[oid] = _fake_op_to_manual_shape(hop)
+    except Exception:
+        pass
+    return out
 
 
 def _extract_ids_from_flow(flow: http.HTTPFlow) -> set:
@@ -81,7 +154,7 @@ def _pick_reference_operation() -> tuple[str | None, int | None]:
     best_id = None
     best_ts = -1
     for op_id, op in (history.operations_cache or {}).items():
-        if not op_id or str(op_id).startswith("m_"):
+        if not op_id or history.is_synthetic_op_id(str(op_id), op if isinstance(op, dict) else None):
             continue
         ts = history.date_str_to_millis(op.get("date", "")) if isinstance(op, dict) else 0
         if ts > best_ts:
@@ -134,6 +207,7 @@ def _url_suggests_detail_or_receipt(u: str) -> bool:
         "fiscal",
         "ofd",
         "operationby",
+        "operation_by_id",
         "operation/info",
         "/operation/",
         "operation_detail",
@@ -159,21 +233,24 @@ def _url_suggests_detail_or_receipt(u: str) -> bool:
 
 def request(flow: http.HTTPFlow) -> None:
     history.ensure_manual_operations_fresh()
-    if not history.manual_operations:
-        return
     if not is_bank_flow(flow):
         return
     _url0 = flow.request.pretty_url or ""
     _url0_lower = _url0.lower()
-    # PDF должен формироваться по исходному id выбранной операции. Подмена m_* на
+    # PDF должен формироваться по исходному id выбранной операции. Подмена m_*/UNIFIED_* на
     # reference-id нужна только API детализации и ломает выбор конкретного чека.
     if "payment_receipt_pdf" in _url0_lower or "operation_statement_pdf" in _url0_lower:
+        return
+    if callable(_is_telemetry_or_log_url) and _is_telemetry_or_log_url(_url0):
         return
     if url_prohibit_proxy_json_mutation(_url0):
         return
     if flow_statements_spravki_context(flow):
         return
-    manual_ids = set(history.manual_operations.keys())
+    synth_ops = _collect_synthetic_ops_map()
+    if not synth_ops:
+        return
+    manual_ids = set(synth_ops.keys())
     ids_in_flow = _extract_ids_from_flow(flow)
     target_ids = [mid for mid in ids_in_flow if mid in manual_ids]
     if not target_ids:
@@ -227,15 +304,19 @@ def request(flow: http.HTTPFlow) -> None:
 def _patch_receipt_like_node(obj: dict, man: dict) -> bool:
     """Узел со ссылкой на операцию (operationId) без полного id — подставляем суммы/тексты."""
     changed = False
-    amt = abs(float(man.get("amount") or 0))
+    raw_amt = man.get("amount")
+    if isinstance(raw_amt, dict):
+        amt = abs(float(raw_amt.get("value") or 0))
+    else:
+        amt = abs(float(raw_amt or 0))
     typ = man.get("type") or "Debit"
-    primary = (man.get("title") or man.get("phone") or man.get("description") or "").strip() or (
+    primary = (man.get("title") or man.get("receiver_name") or man.get("phone") or man.get("description") or "").strip() or (
         "Операция" if typ == "Debit" else "Поступление"
     )
     sender_name = (man.get("requisite_sender_name") or man.get("sender_name") or "").strip() or primary
     second = (man.get("subtitle") or "").strip()
-    bank = (man.get("bank") or "").strip()
-    phone = (man.get("requisite_phone") or man.get("phone") or "").strip()
+    bank = (man.get("bank") or man.get("bank_receiver") or "").strip()
+    phone = (man.get("requisite_phone") or man.get("receiver_phone") or man.get("phone") or "").strip()
     formatted_phone = _format_phone_ru(phone)
 
     if isinstance(obj.get("amount"), dict):
@@ -267,14 +348,36 @@ def _patch_receipt_like_node(obj: dict, man: dict) -> bool:
             except Exception:
                 pass
 
-    for key in ("description", "title", "name", "purpose", "merchantName", "comment", "subtitle"):
+    for key in ("description", "title", "name", "purpose", "merchantName"):
         if key in obj:
-            obj[key] = primary if key not in ("comment", "subtitle") else (second or primary)
+            obj[key] = primary
             changed = True
 
-    if "formattedDescription" in obj:
-        obj["formattedDescription"] = second or primary
+    if "subtitle" in obj:
+        obj["subtitle"] = second or "Переводы"
         changed = True
+
+    if "formattedDescription" in obj:
+        obj["formattedDescription"] = second or "Переводы"
+        changed = True
+
+    comment_val = history.extract_transfer_comment(man)
+    fields_extra = {}
+    if formatted_phone or phone:
+        fields_extra["pointer"] = formatted_phone or phone
+    if primary:
+        fields_extra["maskedFIO"] = primary
+    if bank:
+        fields_extra["bank"] = bank
+    history.apply_transfer_comment_to_operation(
+        obj,
+        comment_val,
+        typ,
+        op_id=str(man.get("id") or ""),
+        provider_id=str(man.get("provider_id") or "p2p-anybank"),
+        fields_extra=fields_extra,
+    )
+    changed = True
 
     if bank and isinstance(obj.get("merchant"), dict):
         obj["merchant"]["name"] = bank
@@ -373,7 +476,13 @@ def _patch_receipt_like_node(obj: dict, man: dict) -> bool:
     return changed
 
 
-def _patch_tree(obj, manual_ids: set) -> bool:
+def _patch_tree(obj, manual_ids_or_map) -> bool:
+    if isinstance(manual_ids_or_map, dict):
+        ops_map = manual_ids_or_map
+    else:
+        base_map = _collect_synthetic_ops_map()
+        ops_map = {str(k): base_map[str(k)] for k in (manual_ids_or_map or ()) if str(k) in base_map}
+    manual_ids = set(ops_map.keys())
     changed = False
 
     def visit(node):
@@ -381,7 +490,7 @@ def _patch_tree(obj, manual_ids: set) -> bool:
         if isinstance(node, dict):
             oid = node.get("id")
             if isinstance(oid, str) and oid in manual_ids:
-                man = history.manual_operations[oid]
+                man = ops_map[oid]
                 merged = history.overlay_manual_on_template(
                     copy.deepcopy(node),
                     oid,
@@ -399,7 +508,7 @@ def _patch_tree(obj, manual_ids: set) -> bool:
                 and op_ref in manual_ids
                 and node.get("id") != op_ref
             ):
-                if _patch_receipt_like_node(node, history.manual_operations[op_ref]):
+                if _patch_receipt_like_node(node, ops_map[op_ref]):
                     changed = True
             for v in node.values():
                 visit(v)
@@ -414,12 +523,21 @@ def _patch_tree(obj, manual_ids: set) -> bool:
 def _patch_manual_detail_semantics(obj, man: dict) -> bool:
     changed = False
     typ = man.get("type") or "Debit"
-    primary = (man.get("title") or man.get("phone") or man.get("description") or "").strip() or (
+    primary = (man.get("title") or man.get("receiver_name") or man.get("phone") or man.get("description") or "").strip() or (
         "Операция" if typ == "Debit" else "Поступление"
     )
     sender_name = (man.get("requisite_sender_name") or man.get("sender_name") or "").strip() or primary
-    phone = (man.get("requisite_phone") or man.get("phone") or "").strip() or str((controller.config.get("name") or {}).get("phone") or "").strip()
+    phone = (man.get("requisite_phone") or man.get("receiver_phone") or man.get("phone") or "").strip() or str((controller.config.get("name") or {}).get("phone") or "").strip()
     formatted_phone = _format_phone_ru(phone)
+    bank = (man.get("bank") or man.get("bank_receiver") or "").strip()
+    comment_val = history.extract_transfer_comment(man)
+    fields_extra = {}
+    if formatted_phone or phone:
+        fields_extra["pointer"] = formatted_phone or phone
+    if primary:
+        fields_extra["maskedFIO"] = primary
+    if bank:
+        fields_extra["bank"] = bank
     account_name = "Black"
     transfer_block_title = "Перевод" if typ == "Debit" else "Пополнение"
     balance_value = float(((controller.config.get("balance") or {}).get("new_balance")) or 0)
@@ -486,6 +604,8 @@ def _patch_manual_detail_semantics(obj, man: dict) -> bool:
             replacement = external_account or account_mask or account_name
         elif "карт" in label or "pan" in label:
             replacement = account_mask or account_name
+        elif "сообщение" in label or "комментар" in label or "message" in label or "comment" in label:
+            replacement = comment_val
         if replacement is None:
             return
         for value_key in value_keys:
@@ -496,7 +616,26 @@ def _patch_manual_detail_semantics(obj, man: dict) -> bool:
             node[label_key] = replacement_label
             changed = True
 
-    def visit(node):
+    _SKIP_OP_PARENT_KEYS = frozenset({
+        "fieldsValues",
+        "providerFields",
+        "payment",
+        "brand",
+        "merchant",
+        "category",
+        "categoryInfo",
+        "spendingCategory",
+        "subgroup",
+        "counterparty",
+        "card",
+        "account",
+        "operationId",
+        "operationTime",
+        "debitingTime",
+        "creditingTime",
+    })
+
+    def visit(node, parent_key: str = ""):
         nonlocal changed
         if isinstance(node, dict):
             patch_label_value(node, "fieldName", ("fieldValue", "value", "text", "description", "subtitle", "content", "body", "primaryText", "secondaryText"))
@@ -526,6 +665,49 @@ def _patch_manual_detail_semantics(obj, man: dict) -> bool:
             if "recipientExternalAccount" in node and external_account:
                 node["recipientExternalAccount"] = external_account
                 changed = True
+
+            is_product_widget = any(k in node for k in ("availableBalance", "accountBalance", "productName"))
+            is_payment_subnode = (parent_key == "payment") or ("providerId" in node and "fieldsValues" in node and "payment" not in node)
+            op_id_val = node.get("operationId")
+            matches_man_id = (
+                (man.get("id") and node.get("id") == man.get("id"))
+                or (man.get("id") and op_id_val == man.get("id"))
+                or (isinstance(op_id_val, dict) and man.get("id") and op_id_val.get("value") == man.get("id"))
+            )
+            looks_like_op_node = (
+                (not is_product_widget)
+                and (not is_payment_subnode)
+                and (parent_key not in _SKIP_OP_PARENT_KEYS)
+                and (
+                    matches_man_id
+                    or ("payment" in node)
+                    or ("operationType" in node and ("amount" in node or "operationTime" in node))
+                    or (("message" in node or "nomination" in node) and ("amount" in node or "description" in node or "status" in node or "type" in node))
+                )
+            )
+            if looks_like_op_node:
+                history.apply_transfer_comment_to_operation(
+                    node,
+                    comment_val,
+                    typ,
+                    op_id=str(man.get("id") or ""),
+                    provider_id=str(man.get("provider_id") or "p2p-anybank"),
+                    fields_extra=fields_extra,
+                )
+                changed = True
+            elif is_payment_subnode:
+                if comment_val and typ == "Debit":
+                    fv = node.get("fieldsValues") if isinstance(node.get("fieldsValues"), dict) else {}
+                    clean_fv = {str(k): str(v) for k, v in fv.items() if v is not None}
+                    for fk, fval in fields_extra.items():
+                        if fval:
+                            clean_fv[fk] = str(fval)
+                    clean_fv["message"] = comment_val
+                    node["fieldsValues"] = clean_fv
+                    changed = True
+                elif not comment_val and isinstance(node.get("fieldsValues"), dict):
+                    node["fieldsValues"].pop("message", None)
+                    changed = True
 
             titleish = " ".join(
                 str(node.get(k) or "").strip().lower()
@@ -606,11 +788,11 @@ def _patch_manual_detail_semantics(obj, man: dict) -> bool:
                     node["account"] = {"id": account_id}
                     changed = True
 
-            for value in node.values():
-                visit(value)
+            for k_child, value in node.items():
+                visit(value, k_child)
         elif isinstance(node, list):
             for item in node:
-                visit(item)
+                visit(item, parent_key)
 
     visit(obj)
     return changed
@@ -618,11 +800,19 @@ def _patch_manual_detail_semantics(obj, man: dict) -> bool:
 
 def response(flow: http.HTTPFlow) -> None:
     history.ensure_manual_operations_fresh()
-    if not history.manual_operations:
-        return
     if not is_bank_flow(flow):
         return
     if not flow.response:
+        return
+    url = flow.request.pretty_url or ""
+    if callable(_is_telemetry_or_log_url) and _is_telemetry_or_log_url(url):
+        return
+    if url_prohibit_proxy_json_mutation(url):
+        return
+    if flow_statements_spravki_context(flow):
+        return
+    synth_ops = _collect_synthetic_ops_map()
+    if not synth_ops:
         return
     ensure_response_decoded(flow)
     txt = flow.response.text or ""
@@ -631,14 +821,14 @@ def response(flow: http.HTTPFlow) -> None:
     if not is_jsonish_response(flow):
         return
 
-    manual_ids = set(history.manual_operations.keys())
-    url = flow.request.pretty_url or ""
-    if url_prohibit_proxy_json_mutation(url):
-        return
-    if flow_statements_spravki_context(flow):
-        return
+    manual_ids = set(synth_ops.keys())
     ids_in_flow = _extract_ids_from_flow(flow)
-    if not (manual_ids & ids_in_flow) and not _url_suggests_detail_or_receipt(url):
+    try:
+        _meta_mid = flow.metadata.get("manual_detail_id")
+    except Exception:
+        _meta_mid = None
+    has_meta_match = isinstance(_meta_mid, str) and _meta_mid in manual_ids
+    if not has_meta_match and not (manual_ids & ids_in_flow) and not _url_suggests_detail_or_receipt(url):
         return
 
     try:
@@ -648,12 +838,12 @@ def response(flow: http.HTTPFlow) -> None:
 
     # Ключевой момент: мы подменяем id/time в запросе на reference-операцию,
     # поэтому в ответе detail-экрана backend часто возвращает id/references
-    # уже от reference. Тогда `_patch_tree` не находит узлы с `m_...` id.
+    # уже от reference. Тогда `_patch_tree` не находит узлы с `m_...`/`UNIFIED_...` id.
     # Возвращаем id назад: replacement_id -> manual_detail_id.
     try:
         manual_id = flow.metadata.get("manual_detail_id")
         replacement_id = flow.metadata.get("replacement_operation_id")
-        if isinstance(manual_id, str) and manual_id in history.manual_operations and isinstance(replacement_id, str) and replacement_id:
+        if isinstance(manual_id, str) and manual_id in synth_ops and isinstance(replacement_id, str) and replacement_id:
             data = _replace_id_refs_in_json(data, replacement_id, manual_id)
     except Exception:
         pass
@@ -663,13 +853,13 @@ def response(flow: http.HTTPFlow) -> None:
         metadata_manual_id = flow.metadata.get("manual_detail_id")
     except Exception:
         metadata_manual_id = None
-    if metadata_manual_id in history.manual_operations:
-        target_manual = history.manual_operations[metadata_manual_id]
+    if metadata_manual_id in synth_ops:
+        target_manual = synth_ops[metadata_manual_id]
     for mid in ids_in_flow:
-        if mid in history.manual_operations:
-            target_manual = history.manual_operations[mid]
+        if mid in synth_ops:
+            target_manual = synth_ops[mid]
             break
-    changed = _patch_tree(data, manual_ids)
+    changed = _patch_tree(data, synth_ops)
     if target_manual:
         changed = _patch_manual_detail_semantics(data, target_manual) or changed
     if changed:

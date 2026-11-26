@@ -233,12 +233,163 @@ def text_indicates_statements_spravki(
     return False
 
 
-_PROHIBIT_JSON_MUTATION_FRAGMENTS = (
-    "/api/cfg/",
+_TELEMETRY_OR_LOG_HOSTS = (
+    "as.tbank.ru",
+    "error-hub.tbank.ru",
+    "sage-collector.tbank.ru",
+    "le.tbank.ru",
+    "tbank.global",
+    "es.tbank.ru",
+    "web2web.tbank.ru",
+    "web2web.diginetica.net",
+)
+
+_TELEMETRY_OR_LOG_FRAGMENTS = (
+    "/front-logs/",
+    "/supreme-beer/",
     "/api/front/log",
     "/api/front/supreme",
+    "/api/messenger/tmsg/api/v2/log",
+    "/api/messenger/tmsg/",
     "eventea",
     "statist",
+)
+
+_STATIC_ASSET_EXTENSIONS = (
+    ".js",
+    ".mjs",
+    ".css",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".otf",
+    ".map",
+    ".mp4",
+    ".webm",
+    ".wasm",
+    ".pdf",
+)
+
+_NON_JSON_CONTENT_TYPE_MARKERS = (
+    "text/html",
+    "text/css",
+    "javascript",
+    "ecmascript",
+    "image/",
+    "font/",
+    "video/",
+    "audio/",
+    "application/pdf",
+    "application/octet-stream",
+    "application/wasm",
+    "text/event-stream",
+    "multipart/",
+    "application/xml",
+    "text/xml",
+)
+
+
+def is_telemetry_or_log_url(url: str) -> bool:
+    """
+    Шумные эндпоинты телеметрии/логов/ошибок: JSON-аддоны должны пропускать их
+    до decode() и json.loads().
+    """
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+    if any(frag in u for frag in _TELEMETRY_OR_LOG_FRAGMENTS):
+        return True
+    try:
+        parsed = urlparse(u if "://" in u else f"https://{u}")
+        host = (parsed.hostname or "").lower().strip(".")
+        if host and any(host == h or host.endswith("." + h) for h in _TELEMETRY_OR_LOG_HOSTS):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_bank_json_candidate(flow) -> bool:
+    """
+    Быстрый пред-фильтр для response() JSON-аддонов ДО вызова ensure_response_decoded():
+    отсекает OPTIONS/HEAD, 204/304/ошибки, пустые тела, статику, не-JSON Content-Type
+    и все URL телеметрии / запрета мутаций.
+    """
+    if not flow:
+        return False
+    req = getattr(flow, "request", None)
+    resp = getattr(flow, "response", None)
+    if not req or not resp:
+        return False
+
+    method = (getattr(req, "method", "") or "").upper()
+    if method in ("OPTIONS", "HEAD", "CONNECT"):
+        return False
+
+    try:
+        sc = int(getattr(resp, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        sc = 0
+    if sc in (204, 304) or sc < 200 or sc >= 400:
+        return False
+
+    raw = getattr(resp, "raw_content", None)
+    if raw is not None:
+        if len(raw) == 0:
+            return False
+    elif not getattr(resp, "text", None):
+        return False
+
+    if not is_bank_flow(flow):
+        return False
+
+    url = getattr(req, "pretty_url", "") or ""
+    if url_prohibit_proxy_json_mutation(url):
+        return False
+
+    try:
+        raw_path = (getattr(req, "path", "") or "").split("?", 1)[0].lower()
+        if not raw_path and url:
+            raw_path = (urlparse(url).path or "").lower()
+        if raw_path.endswith(_STATIC_ASSET_EXTENSIONS):
+            return False
+    except Exception:
+        pass
+
+    try:
+        ct = (resp.headers.get("content-type") or "").lower()
+    except Exception:
+        ct = ""
+    if ct and "json" not in ct and "graphql" not in ct:
+        if any(marker in ct for marker in _NON_JSON_CONTENT_TYPE_MARKERS):
+            return False
+
+    return True
+
+
+def mark_mutated_json_no_store(flow) -> None:
+    """Сбрасывает ETag/кэш-заголовки после мутации JSON-ответа."""
+    try:
+        resp = getattr(flow, "response", None)
+        if not resp:
+            return
+        for hdr in ("ETag", "etag", "Last-Modified", "last-modified", "Expires", "expires"):
+            resp.headers.pop(hdr, None)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    except Exception:
+        pass
+
+
+_PROHIBIT_JSON_MUTATION_FRAGMENTS = (
+    "/api/cfg/",
     "id.tbank.ru/auth",
     "mappings/prod/",
     "cm/my_invoices",
@@ -253,11 +404,13 @@ def url_prohibit_proxy_json_mutation(url: str) -> bool:
     """
     Ответы, которые нельзя json.loads + патчить прокси-скриптами: ломается Tramvai / Zod / SSO / «Справки».
 
-    - /api/cfg/* (включая web-gateway), /api/front/log, /api/front/supreme, eventea, statist,
-      id.tbank.ru/auth, mappings/prod/, allbundles, *.json на cdn.tbank.ru — конфиги/телеметрия/авторизация/бандлы.
+    - Любая телеметрия/логи из is_telemetry_or_log_url(url).
+    - /api/cfg/* (включая web-gateway), id.tbank.ru/auth, mappings/prod/, allbundles, *.json на cdn.tbank.ru.
     - cx-evolution-api … documents — запросы справок (filter-new-document и т.д.).
     - cm/my_invoices, cm/invoices_to_pay, get_invoices — счета на оплату (строгая Zod-схема).
     """
+    if is_telemetry_or_log_url(url):
+        return True
     u = (url or "").lower()
     if any(frag in u for frag in _PROHIBIT_JSON_MUTATION_FRAGMENTS):
         return True

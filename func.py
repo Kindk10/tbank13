@@ -562,6 +562,45 @@ def _generate_operation_receipt_impl(op_data, output_path=None):
     page.insert_text(POSITIONS["identificator2"], identificator2, fontname=font_n, fontsize=9.008945, color=(51/255, 51/255, 51/255))
     page.insert_text(POSITIONS["kvit"], kvit, fontname=font_n, fontsize=9.008945, color=(51/255, 51/255, 51/255))
 
+    comment = str(
+        op_data.get("comment")
+        or op_data.get("message")
+        or op_data.get("nomination")
+        or ""
+    ).strip()
+    if comment:
+        comment_label = "Сообщение получателю" if op_type == "Debit" else "Сообщение"
+        page.insert_text(
+            (20, 344 + 8.18),
+            comment_label,
+            fontname=font_n,
+            fontsize=9,
+            color=(51 / 255, 51 / 255, 51 / 255),
+        )
+        comment_rect = fitz.Rect(110, 344, 250.02, 415)
+        rc = page.insert_textbox(
+            comment_rect,
+            comment,
+            fontname=font_n,
+            fontsize=9,
+            color=(51 / 255, 51 / 255, 51 / 255),
+            align=TEXT_ALIGN_RIGHT,
+        )
+        if rc < 0:
+            # PyMuPDF draws nothing on overflow; truncate cleanly so the row always renders.
+            trimmed = comment
+            while len(trimmed) > 3:
+                trimmed = trimmed[:-4].rstrip() + "..."
+                if page.insert_textbox(
+                    comment_rect,
+                    trimmed,
+                    fontname=font_n,
+                    fontsize=9,
+                    color=(51 / 255, 51 / 255, 51 / 255),
+                    align=TEXT_ALIGN_RIGHT,
+                ) >= 0:
+                    break
+
     doc.save(output_path, clean=True, deflate=True, garbage=4, pretty=False)
     doc.close()
     

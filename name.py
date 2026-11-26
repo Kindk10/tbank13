@@ -5,14 +5,16 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bank_filter import (
-    is_bank_flow,
+    is_bank_json_candidate,
     ensure_response_decoded,
-    bank_debug_enabled,
+    is_jsonish_response,
     flow_statements_spravki_context,
-    url_prohibit_proxy_json_mutation,
+    mark_mutated_json_no_store,
 )
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+_CFG_CACHE = {"sig": None, "data": None}
+_LK_URL_MARKERS = ("userinfo", "personal_info", "profile", "messenger/userInfo", "contracts")
 
 
 def _digits_phone_number(phone: str, phone_number: str = "") -> str:
@@ -34,25 +36,33 @@ def _digits_phone_number(phone: str, phone_number: str = "") -> str:
 
 
 def get_config():
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return cfg["name"]
+    st = os.stat(CONFIG_FILE)
+    sig = (st.st_mtime_ns, st.st_size)
+    if _CFG_CACHE["sig"] != sig or _CFG_CACHE["data"] is None:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            _CFG_CACHE["data"] = json.load(f)
+        _CFG_CACHE["sig"] = sig
+    return _CFG_CACHE["data"]["name"]
+
+
+def _is_target_name_url(url: str) -> bool:
+    return (
+        "auth/short_personal_info" in url
+        or "document/all" in url
+        or any(x in url for x in _LK_URL_MARKERS)
+    )
+
 
 def response(flow: http.HTTPFlow) -> None:
+    if not is_bank_json_candidate(flow):
+        return
     url = flow.request.pretty_url
-
-    if not is_bank_flow(flow):
-        return
-    if not flow.response:
-        return
-    if url_prohibit_proxy_json_mutation(url):
+    if not _is_target_name_url(url):
         return
     if flow_statements_spravki_context(flow):
         return
     ensure_response_decoded(flow)
-    if not flow.response.text:
-        if bank_debug_enabled():
-            print(f"[name] пустой ответ: {url[:120]}")
+    if not flow.response.text or not is_jsonish_response(flow):
         return
     
     # Получаем свежий конфиг при каждом запросе
@@ -114,7 +124,8 @@ def response(flow: http.HTTPFlow) -> None:
                     # #endregion
             
             flow.response.text = json.dumps(data, ensure_ascii=False)
-        except:
+            mark_mutated_json_no_store(flow)
+        except Exception:
             pass
     
     # ===== ДОКУМЕНТЫ =====
@@ -173,11 +184,12 @@ def response(flow: http.HTTPFlow) -> None:
                                     person["middleName"]["value"] = TEST_DATA["middle_name"]
             
             flow.response.text = json.dumps(data, ensure_ascii=False)
-        except:
+            mark_mutated_json_no_store(flow)
+        except Exception:
             pass
     
     # ===== ЛК =====
-    if any(x in url for x in ["userinfo", "personal_info", "profile", "messenger/userInfo", "contracts"]):
+    if any(x in url for x in _LK_URL_MARKERS):
         try:
             data = json.loads(flow.response.text)
             if isinstance(data, dict):
@@ -204,7 +216,8 @@ def response(flow: http.HTTPFlow) -> None:
                                 item["msisdn"] = TEST_DATA["phone_number"]
             
             flow.response.text = json.dumps(data, ensure_ascii=False)
-        except:
+            mark_mutated_json_no_store(flow)
+        except Exception:
             pass
 
 print("[+] name.py загружен (динамический конфиг)")

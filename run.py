@@ -71,41 +71,45 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_GET(self):
-        if self.path == "/admin" or self.path == "/admin/":
+        parsed = urlparse(self.path)
+        path_only = parsed.path
+
+        if path_only == "/admin" or path_only == "/admin/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_PANEL.encode("utf-8"))
             return
         
-        if self.path == "/api/operations":
-            self.send_json(self.get_operations())
+        if path_only == "/api/operations":
+            qs = parse_qs(parsed.query)
+            compact = (qs.get("compact") or ["0"])[0].strip().lower() in ("1", "true", "yes")
+            self.send_json_cors(self.get_operations(compact=compact))
             return
         
-        if self.path == "/api/config":
+        if path_only == "/api/config":
             self.send_json(config)
             return
 
-        if self.path.split("?", 1)[0] == "/api/panel_income_expense":
+        if path_only == "/api/panel_income_expense":
             history.ensure_manual_operations_fresh()
             di, de, _, _ = history.get_panel_chart_display_totals()
             self.send_json_cors({"income": di, "expense": de})
             return
 
-        if self.path.split("?", 1)[0] == "/api/effective_balance":
+        if path_only == "/api/effective_balance":
             base = float((config.get("balance") or {}).get("new_balance") or 0)
             adj = history.compute_manual_balance_adjustment()
             self.send_json_cors({"value": round(base + float(adj), 2)})
             return
         
-        if self.path == "/api/balance":
+        if path_only == "/api/balance":
             base = config.get("balance", {}).get("new_balance", 0)
             adj = history.compute_manual_balance_adjustment()
             self.send_json({"base": base, "adjustment": adj, "effective": base + adj})
             return
 
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/manual_operation_receipt":
+        if path_only == "/api/manual_operation_receipt":
             qs = parse_qs(parsed.query)
             op_id = (qs.get("operationId") or qs.get("operation_id") or qs.get("id") or [""])[0].strip()
             pdf_path = history.ensure_operation_receipt_pdf_path(op_id)
@@ -231,9 +235,12 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
     
-    def get_operations(self):
+    def get_operations(self, compact: bool = False):
         history.ensure_manual_operations_fresh()
-        return history.build_operations_api_response()
+        try:
+            return history.build_operations_api_response(compact=compact)
+        except TypeError:
+            return history.build_operations_api_response()
     
     def handle_add_operation(self, body):
         try:
@@ -243,12 +250,18 @@ class PanelHandler(BaseHTTPRequestHandler):
             bank = (data.get("bank") or "").strip()
             title = (data.get("title") or "").strip()
             subtitle = (data.get("subtitle") or "").strip()
-            description = (data.get("description") or "").strip()
+            if "comment" in data:
+                comment = (data.get("comment") or "").strip()
+                description = (data.get("description") or "").strip()
+            else:
+                comment = (data.get("description") or "").strip()
+                description = ""
             sender_name = (data.get("sender_name") or "").strip()
             requisite_sender_name = (data.get("requisite_sender_name") or sender_name).strip()
             bank_preset = (data.get("bank_preset") or "custom").strip().lower() or "custom"
             phone = (data.get("phone") or "").strip()
             requisite_phone = (data.get("requisite_phone") or phone).strip()
+            receipt_phone = (data.get("receipt_phone") or "").strip()
             card_number = (data.get("card_number") or "").strip()
             op_type = "Debit" if direction == "out" else "Credit"
 
@@ -262,6 +275,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 "amount": amount,
                 "type": op_type,
                 "description": description,
+                "comment": comment,
                 "bank": bank,
                 "title": title,
                 "subtitle": subtitle,
@@ -269,6 +283,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 "requisite_sender_name": requisite_sender_name,
                 "phone": phone,
                 "requisite_phone": requisite_phone,
+                "receipt_phone": receipt_phone,
                 "card_number": card_number,
                 "bank_preset": bank_preset,
                 "operationTime": {"milliseconds": ms, "seconds": ms / 1000.0},
@@ -343,25 +358,44 @@ class PanelHandler(BaseHTTPRequestHandler):
     def handle_update_operation(self, body):
         try:
             data = json.loads(body)
-            op_id = data.get("id", "").strip()
+            op_id = (data.get("id") or "").strip()
             history.ensure_manual_operations_fresh()
-            if not op_id or op_id not in history.manual_operations:
+            if not op_id:
+                self.send_error_json(404, "Не найдена")
+                return
+            if op_id not in history.manual_operations:
+                upd_fn = getattr(history, "update_fake_transfer_operation", None)
+                if callable(upd_fn) and upd_fn(op_id, data):
+                    history.sync_panel_income_expense_with_operations()
+                    self.send_json({"status": "ok", "id": op_id})
+                    print(f"[run.py] Обновлён мок-перевод {op_id}")
+                    return
                 self.send_error_json(404, "Не найдена")
                 return
             
             rec = history.manual_operations[op_id]
             if "amount" in data:
                 rec["amount"] = abs(float(data.get("amount") or 0))
+            if "type" in data and data.get("type") in ("Credit", "Debit"):
+                rec["type"] = data["type"]
             if "direction" in data:
                 rec["type"] = "Debit" if data.get("direction") == "out" else "Credit"
-            for k in ("title", "subtitle", "description", "bank", "bank_preset", "phone", "card_number", "sender_name", "requisite_phone", "requisite_sender_name"):
+            if "comment" in data:
+                rec["comment"] = (data.get("comment") or "").strip() if isinstance(data.get("comment"), str) else ""
+                if "description" in data and isinstance(data.get("description"), str):
+                    rec["description"] = data["description"].strip()
+            elif "description" in data:
+                rec["comment"] = (data.get("description") or "").strip() if isinstance(data.get("description"), str) else ""
+            for k in ("title", "subtitle", "bank", "bank_preset", "phone", "card_number", "sender_name", "requisite_phone", "requisite_sender_name", "receipt_phone"):
                 if k in data:
                     rec[k] = (data.get(k) or "").strip() if isinstance(data.get(k), str) else data.get(k)
             if data.get("datetime"):
                 dstr, op_ms = history.parse_panel_datetime_iso(data["datetime"])
                 rec["date"] = dstr
                 rec["operationTime"] = {"milliseconds": op_ms, "seconds": op_ms / 1000.0}
-            
+            inv_fn = getattr(history, "_invalidate_manual_receipt", None)
+            if callable(inv_fn):
+                inv_fn(rec)
             history.save_manual_operations()
             history.sync_panel_income_expense_with_operations()
             self.send_json({"status": "ok", "id": op_id})

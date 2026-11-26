@@ -5,15 +5,15 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bank_filter import (
-    is_bank_flow,
+    is_bank_json_candidate,
     ensure_response_decoded,
-    bank_debug_enabled,
     is_jsonish_response,
     flow_statements_spravki_context,
-    url_prohibit_proxy_json_mutation,
+    mark_mutated_json_no_store,
 )
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+_CFG_CACHE = {"sig": None, "data": None}
 
 
 def _effective_balance(base: float) -> float:
@@ -25,10 +25,15 @@ def _effective_balance(base: float) -> float:
     except Exception:
         return float(base)
 
+
 def get_config():
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return cfg["balance"]
+    st = os.stat(CONFIG_FILE)
+    sig = (st.st_mtime_ns, st.st_size)
+    if _CFG_CACHE["sig"] != sig or _CFG_CACHE["data"] is None:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            _CFG_CACHE["data"] = json.load(f)
+        _CFG_CACHE["sig"] = sig
+    return _CFG_CACHE["data"]["balance"]
 
 
 def _strip_card_previews(node: dict) -> None:
@@ -89,26 +94,16 @@ def _patch_first_balance_like_node(node, balance_value: float, collect_sum, card
     return False
 
 def response(flow: http.HTTPFlow) -> None:
-    url = flow.request.pretty_url
-
-    if not is_bank_flow(flow):
+    if not is_bank_json_candidate(flow):
         return
-    if not flow.response:
-        return
-    ensure_response_decoded(flow)
-    if not flow.response.text:
-        if bank_debug_enabled():
-            print(f"[balance] пустой ответ: {url[:120]}")
-        return
-
-    if not is_jsonish_response(flow):
-        return
-
-    if url_prohibit_proxy_json_mutation(url):
-        return
-
     if flow_statements_spravki_context(flow):
         return
+
+    ensure_response_decoded(flow)
+    if not flow.response.text or not is_jsonish_response(flow):
+        return
+
+    url = flow.request.pretty_url
 
     try:
         balance_cfg = get_config()
@@ -117,9 +112,11 @@ def response(flow: http.HTTPFlow) -> None:
             "new_card_number": balance_cfg["new_card_number"],
             "new_collect_sum": balance_cfg["new_collect_sum"],
         }
-    except:
+    except Exception:
         return
-    
+
+    mutated = False
+
     # ===== ОСНОВНОЙ СПИСОК СЧЕТОВ =====
     # Только первый расчётный счёт с картами — иначе все продукты получали один номер/баланс и плодились «лишние» карты в UI.
     if "moneyAmount" in flow.response.text and "cards" in flow.response.text:
@@ -140,6 +137,7 @@ def response(flow: http.HTTPFlow) -> None:
                         break
                 if primary_done:
                     flow.response.text = json.dumps(data, ensure_ascii=False)
+                    mutated = True
         except Exception:
             pass
     
@@ -154,6 +152,7 @@ def response(flow: http.HTTPFlow) -> None:
                     if isinstance(ab, dict) and "value" in ab:
                         ab["value"] = TEST_DATA["new_balance"]
                 flow.response.text = json.dumps(data, ensure_ascii=False)
+                mutated = True
         except Exception:
             pass
     
@@ -173,6 +172,7 @@ def response(flow: http.HTTPFlow) -> None:
                         bal["value"] = TEST_DATA["new_balance"]
                 _strip_card_previews(first)
                 flow.response.text = json.dumps(data, ensure_ascii=False)
+                mutated = True
         except Exception:
             pass
 
@@ -187,7 +187,11 @@ def response(flow: http.HTTPFlow) -> None:
                 TEST_DATA["new_card_number"],
             ):
                 flow.response.text = json.dumps(data, ensure_ascii=False)
+                mutated = True
         except Exception:
             pass
+
+    if mutated:
+        mark_mutated_json_no_store(flow)
 
 print("[+] balance.py загружен (динамический конфиг)")

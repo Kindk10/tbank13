@@ -21,5 +21,80 @@
     },
     "pdf_path": "receipt_m_63165bdc16_20260417_020855.pdf",
     "logo": "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vd2lsZGJlcnJpZXMtYmFuay5wbmc="
+  },
+  "m_8801d2b50485": {
+    "id": "m_8801d2b50485",
+    "date": "26.11.2026, 17:39:14",
+    "amount": 777.0,
+    "type": "Debit",
+    "description": "",
+    "comment": "Тест ручной расход 777",
+    "bank": "Сбербанк",
+    "title": "Тест Получатель Д",
+    "subtitle": "Переводы",
+    "sender_name": "",
+    "requisite_sender_name": "",
+    "phone": "+79997770001",
+    "requisite_phone": "+79997770001",
+    "receipt_phone": "",
+    "card_number": "",
+    "bank_preset": "sber",
+    "logo": "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vc2Jlci5wbmc=",
+    "operationTime": {
+      "milliseconds": 1795703954574,
+      "seconds": 1795703954.574
+    },
+    "pdf_path": "C:\\Users\\dkk15\\Downloads\\Telegram Desktop\\tbankmitm версия 1.3\\tbankmitm\\receipt_m_8801d2b504_20261126_173914.pdf",
+    "_receipt_fp": "bca2f294f41441c943ab"
+  },
+  "m_05502218476f": {
+    "id": "m_05502218476f",
+    "date": "26.11.2026, 17:39:14",
+    "amount": 888.0,
+    "type": "Credit",
+    "description": "",
+    "comment": "Тест ручной доход 888",
+    "bank": "ВТБ",
+    "title": "Тест Отправитель К",
+    "subtitle": "Переводы",
+    "sender_name": "",
+    "requisite_sender_name": "",
+    "phone": "+79998880002",
+    "requisite_phone": "+79998880002",
+    "receipt_phone": "",
+    "card_number": "",
+    "bank_preset": "vtb",
+    "logo": "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vdnRiYmFuay5wbmc=",
+    "operationTime": {
+      "milliseconds": 1795703954680,
+      "seconds": 1795703954.68
+    },
+    "pdf_path": "C:\\Users\\dkk15\\Downloads\\Telegram Desktop\\tbankmitm версия 1.3\\tbankmitm\\receipt_m_0550221847_20261126_173914.pdf",
+    "_receipt_fp": "feb2488feb2fcc32c0db"
+  },
+  "m_2128e968825c": {
+    "id": "m_2128e968825c",
+    "date": "26.11.2026, 17:39:14",
+    "amount": 111.0,
+    "type": "Debit",
+    "description": "",
+    "comment": "",
+    "bank": "Т-Банк",
+    "title": "Тест БезКоммента",
+    "subtitle": "Переводы",
+    "sender_name": "",
+    "requisite_sender_name": "",
+    "phone": "+79991110003",
+    "requisite_phone": "+79991110003",
+    "receipt_phone": "",
+    "card_number": "",
+    "bank_preset": "tbank",
+    "logo": "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vdGlua29mZi1uZXcucG5n",
+    "operationTime": {
+      "milliseconds": 1795703954784,
+      "seconds": 1795703954.784
+    },
+    "pdf_path": "C:\\Users\\dkk15\\Downloads\\Telegram Desktop\\tbankmitm версия 1.3\\tbankmitm\\receipt_m_2128e96882_20261126_173914.pdf",
+    "_receipt_fp": "b8ffbc3fbafb14b95b68"
   }
 }

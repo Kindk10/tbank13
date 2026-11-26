@@ -34,6 +34,11 @@ def build_mitmdump_argv(script_dir: str) -> list[str]:
 
     listen = os.environ.get("TBANKMITM_PROXY_LISTEN_HOST", "127.0.0.1").strip() or "127.0.0.1"
     port = os.environ.get("TBANKMITM_PROXY_PORT", "8082").strip() or "8082"
+    http2_raw = os.environ.get("TBANKMITM_HTTP2", "1").strip().lower()
+    http2_val = "false" if http2_raw in ("0", "false", "no", "off") else "true"
+    conn_strategy = (os.environ.get("TBANKMITM_CONNECTION_STRATEGY", "lazy").strip().lower() or "lazy")
+    if conn_strategy not in ("lazy", "eager"):
+        conn_strategy = "lazy"
 
     argv.extend(
         [
@@ -46,7 +51,9 @@ def build_mitmdump_argv(script_dir: str) -> list[str]:
             "--set",
             "ssl_insecure=true",
             "--set",
-            "http2=false",
+            f"http2={http2_val}",
+            "--set",
+            f"connection_strategy={conn_strategy}",
         ]
     )
     return argv

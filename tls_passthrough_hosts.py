@@ -27,7 +27,7 @@ try:
 except re.error:
     _EXTRA_RE = None
 
-# Хосты, для которых типичен 403 при перехваченном TLS (микрофронты «Справок», статика, SSO-формы, CDN).
+# Хосты, для которых типичен 403 при перехваченном TLS (микрофронты «Справок», статика, SSO-формы, CDN, telemetry).
 _DEFAULT_SNIS = (
     "s3-msk.tinkoff.ru",
     "s3-msk.tbank.ru",
@@ -51,8 +51,16 @@ _DEFAULT_SNIS = (
     "csc-messenger-front.t-static.ru",
     "content-hub.t-static.ru",
     "acdn.tinkoff.ru",
+    "acdn.tbank.ru",
+    "cdn.tinkoff.ru",
     "static.tbank.ru",
     "static.tinkoff.ru",
+    "media.tinkoff.ru",
+)
+
+_DEFAULT_SNI_RE = re.compile(
+    r"^(?:sso-captcha-\d+\.t-static\.ru|s3-[a-z0-9-]+\.(?:tbank|tinkoff)\.ru)$",
+    re.I,
 )
 
 
@@ -60,6 +68,8 @@ def _sni_matches(sni_l: str) -> bool:
     for h in _DEFAULT_SNIS:
         if sni_l == h or sni_l.endswith("." + h):
             return True
+    if _DEFAULT_SNI_RE.match(sni_l):
+        return True
     if _EXTRA_RE is not None and _EXTRA_RE.search(sni_l):
         return True
     return False

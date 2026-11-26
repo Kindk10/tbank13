@@ -256,6 +256,7 @@
         .op-meta-line { font-size: 0.8rem; color: #a0aec0; margin-top: 2px; }
         .op-meta-line.bank { color: #718096; }
         .op-meta-line.requisite { color: #c7a83a; }
+        .op-meta-line.comment { color: #90cdf4; }
         .op-amount {
             font-weight: 700;
             font-size: 1.1rem;
@@ -855,11 +856,11 @@
         }
 
         function openEditManualModal(op) {
-            if (!op || !op.manual || !op.id) return;
+            if (!op || (!op.manual && !op.fake_transfer) || !op.id) return;
             document.getElementById('edit_manual_id').value = op.id;
             document.getElementById('edit_direction').value = op.type === 'Credit' ? 'in' : 'out';
             document.getElementById('edit_amount').value = Math.abs(op.amount || 0);
-            const preset = (op.bank_preset || 'custom').toLowerCase();
+            const preset = (op.bank_preset || (op.fake_transfer ? 'sbp' : 'custom')).toLowerCase();
             const sel = document.getElementById('edit_bank_preset');
             if ([...sel.options].some(o => o.value === preset)) sel.value = preset;
             else sel.value = 'custom';
@@ -867,11 +868,14 @@
             document.getElementById('edit_datetime').value = bankDateToDatetimeLocal(op.date);
             const editSec = document.getElementById('edit_seconds');
             if (editSec) editSec.value = String(bankDateToSeconds(op.date));
-            document.getElementById('edit_title').value = op.title || '';
+            document.getElementById('edit_title').value = op.title || op.desc || '';
             document.getElementById('edit_subtitle').value = op.subtitle || '';
-            document.getElementById('edit_phone').value = op.phone || '';
+            document.getElementById('edit_phone').value = op.requisite_phone || op.phone || '';
             document.getElementById('edit_card_number').value = op.card_number || '';
-            document.getElementById('edit_desc').value = op.description || '';
+            const opComment = (op.comment !== undefined && op.comment !== null)
+                ? String(op.comment)
+                : (op.manual ? String(op.description || '') : '');
+            document.getElementById('edit_desc').value = opComment;
             const modal = document.getElementById('editManualModal');
             modal.classList.add('show');
         }
@@ -888,6 +892,7 @@
                 document.getElementById('edit_datetime').value,
                 secEl ? secEl.value : 0
             );
+            const commentVal = (document.getElementById('edit_desc').value || '').trim();
             fetch('/api/operations/update', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -901,8 +906,9 @@
                     title: document.getElementById('edit_title').value,
                     subtitle: document.getElementById('edit_subtitle').value,
                     phone: document.getElementById('edit_phone').value,
+                    requisite_phone: document.getElementById('edit_phone').value,
                     card_number: document.getElementById('edit_card_number').value,
-                    description: document.getElementById('edit_desc').value
+                    comment: commentVal
                 })
             })
             .then(r => r.json())
@@ -1169,7 +1175,7 @@
             const search = document.getElementById('search').value.toLowerCase();
             const type = document.getElementById('typeFilter').value;
             let filtered = operations.filter(op => {
-                const hay = ((op.desc || '') + ' ' + (op.subtitle || '') + ' ' + (op.bank || '') + ' ' + (op.requisite_phone || op.phone || '') + ' ' + (op.requisite_sender_name || op.sender_name || '') + ' ' + (op.card_number || '')).toLowerCase();
+                const hay = ((op.desc || '') + ' ' + (op.subtitle || '') + ' ' + (op.comment || '') + ' ' + (op.bank || '') + ' ' + (op.requisite_phone || op.phone || '') + ' ' + (op.requisite_sender_name || op.sender_name || '') + ' ' + (op.card_number || '')).toLowerCase();
                 if (search && !hay.includes(search)) return false;
                 if (type === 'income' && op.type !== 'Credit') return false;
                 if (type === 'expense' && op.type !== 'Debit') return false;
@@ -1191,13 +1197,16 @@
                 const sign = income ? '+' : '-';
                 const metaLines = [];
                 if (op.subtitle) metaLines.push(`<div class="op-meta-line">${escapeHtml(op.subtitle)}</div>`);
+                const opComment = (op.comment !== undefined && op.comment !== null) ? String(op.comment).trim() : '';
+                if (opComment) metaLines.push(`<div class="op-meta-line comment">💬 ${escapeHtml(opComment)}</div>`);
                 if (op.requisite_phone || op.phone) metaLines.push(`<div class="op-meta-line requisite">${escapeHtml(op.requisite_phone || op.phone)}</div>`);
                 if (op.requisite_sender_name || op.sender_name) metaLines.push(`<div class="op-meta-line requisite">${escapeHtml(op.requisite_sender_name || op.sender_name)}</div>`);
                 if (op.card_number) metaLines.push(`<div class="op-meta-line requisite">${escapeHtml(op.card_number)}</div>`);
                 if (op.bank) metaLines.push(`<div class="op-meta-line bank">${escapeHtml(op.bank)}${op.bank_preset && op.bank_preset !== 'custom' ? ' · ' + escapeHtml(op.bank_preset) : ''}</div>`);
                 else if (op.bank_preset && op.bank_preset !== 'custom') metaLines.push(`<div class="op-meta-line bank">${escapeHtml(op.bank_preset)}</div>`);
                 const opJson = JSON.stringify(op).replace(/</g, '\u003c');
-                const editBtn = op.manual ? `<button class="action-btn" style="margin-right:6px;" onclick='openEditManualModal(${opJson})' title="Изменить"><i class="fas fa-pen"></i></button>` : '';
+                const canEdit = op.manual || op.fake_transfer;
+                const editBtn = canEdit ? `<button class="action-btn" style="margin-right:6px;" onclick='openEditManualModal(${opJson})' title="Изменить"><i class="fas fa-pen"></i></button>` : '';
                 const canDelete = op.manual || op.fake_transfer;
                 const delBtn = canDelete ? `<button class="action-btn" style="margin-right:6px;" onclick="deleteManualOp('${op.id}')" title="Удалить"><i class="fas fa-trash-alt"></i></button>` : '';
                 const receiptBtn = op.manual && op.type === 'Debit' ? `<button class="action-btn" style="margin-right:6px;" onclick="generateReceipt('${op.id}')" title="Чек"><i class="fas fa-file-pdf"></i></button>` : '';
@@ -1343,7 +1352,7 @@
                 secEl ? secEl.value : 0
             );
             const phone = document.getElementById('manual_phone').value || '';
-            const comment = document.getElementById('manual_comment').value || '';
+            const comment = (document.getElementById('manual_comment').value || '').trim();
             
             const body = {
                 direction: direction,
@@ -1351,11 +1360,12 @@
                 bank: bank,
                 title: title,
                 subtitle: subtitle,
-                description: comment,
+                comment: comment,
                 bank_preset: bank_preset,
                 logo: presetLogo,
                 datetime: datetime,
                 phone: phone,
+                requisite_phone: phone,
                 card_number: document.getElementById('manual_card_number').value || ''
             };
             console.log('[DEBUG] отправка:', body);

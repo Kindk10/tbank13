@@ -15,7 +15,7 @@ from pathlib import Path
 import subprocess
 import urllib.parse
 import time
-from urllib.parse import unquote
+from urllib.parse import unquote, unquote_plus
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(_SCRIPT_DIR, "config.json")
@@ -385,6 +385,8 @@ transfer_data = load_data() or {
     "sbp_operation_id": None,
     "last_pdf_path": None,
     "payment_id": None,
+    "comment": "",
+    "provider_id": "p2p-anybank",
     "fake_history": [],
 }
 if not isinstance(transfer_data.get("fake_history"), list):
@@ -394,6 +396,8 @@ for _k, _v in (
     ("merchant_name", None),
     ("merchant_logo", None),
     ("is_merchant_payment", False),
+    ("comment", ""),
+    ("provider_id", "p2p-anybank"),
 ):
     transfer_data.setdefault(_k, _v)
 fake_history = transfer_data["fake_history"]
@@ -416,7 +420,9 @@ def _build_fake_record(operation_id: str, op_ts_ms: int, pdf_path=None) -> dict:
             date_full = history_mod.millis_to_bank_date_str(op_ts_ms)
         except Exception:
             date_full = datetime.now().strftime("%d.%m.%Y, %H:%M:%S")
-    return {
+    comment = str(transfer_data.get("comment") or "").strip()
+    provider_id = str(transfer_data.get("provider_id") or "p2p-anybank").strip() or "p2p-anybank"
+    rec = {
         "id": operation_id,
         "operationId": {"value": operation_id, "source": "PrimeAuth"},
         "isExternalCard": False,
@@ -486,7 +492,26 @@ def _build_fake_record(operation_id: str, op_ts_ms: int, pdf_path=None) -> dict:
         "receiver_phone": str(transfer_data.get("receiver_phone") or "").strip(),
         "receiver_name": str(transfer_data.get("receiver_name") or "").strip(),
         "bank_receiver": str(transfer_data.get("bank_receiver") or "").strip(),
+        "comment": comment,
+        "provider_id": provider_id,
     }
+    fields_extra = {}
+    if rec["receiver_phone"]:
+        fields_extra["pointer"] = rec["receiver_phone"]
+    if rec["receiver_name"]:
+        fields_extra["maskedFIO"] = rec["receiver_name"]
+    if rec["bank_receiver"]:
+        fields_extra["bank"] = rec["bank_receiver"]
+    history_mod.apply_transfer_comment_to_operation(
+        rec,
+        comment,
+        "Debit",
+        op_id=operation_id,
+        provider_id=provider_id,
+        fields_extra=fields_extra,
+    )
+    rec["comment"] = comment
+    return rec
 
 
 def _normalize_fake_record_for_feed(op: dict, ref: dict = None) -> dict:
@@ -531,6 +556,25 @@ def _normalize_fake_record_for_feed(op: dict, ref: dict = None) -> dict:
             if ref.get(k):
                 out[k] = ref[k]
     out["isInner"] = False
+    comment_val = history_mod.extract_transfer_comment(out)
+    fields_extra = {}
+    rp = str(out.get("receiver_phone") or out.get("requisite_phone") or out.get("phone") or "").strip()
+    if rp:
+        fields_extra["pointer"] = rp
+    rn = str(out.get("receiver_name") or out.get("description") or out.get("title") or "").strip()
+    if rn:
+        fields_extra["maskedFIO"] = rn
+    bn = str(out.get("bank_receiver") or out.get("bank") or "").strip()
+    if bn:
+        fields_extra["bank"] = bn
+    history_mod.apply_transfer_comment_to_operation(
+        out,
+        comment_val,
+        op_type,
+        op_id=str(out.get("id") or ""),
+        provider_id=str(out.get("provider_id") or "p2p-anybank"),
+        fields_extra=fields_extra,
+    )
     return out
 
 
@@ -625,8 +669,61 @@ def generate_sbp_operation_id():
 def safe_json(text):
     try:
         return json.loads(text)
-    except:
+    except Exception:
         return None
+
+
+def _parse_pay_parameters_from_body(body_text: str):
+    """Разбирает payParameters из application/x-www-form-urlencoded (+ пробелы!) или JSON."""
+    if not body_text:
+        return None
+    if "payParameters=" in body_text:
+        try:
+            params = urllib.parse.parse_qs(body_text, keep_blank_values=True)
+            pay_str = (params.get("payParameters") or [""])[0]
+            if pay_str:
+                parsed = safe_json(pay_str)
+                if isinstance(parsed, dict):
+                    return parsed
+                parsed = safe_json(unquote_plus(pay_str))
+                if isinstance(parsed, dict):
+                    return parsed
+        except Exception:
+            pass
+        try:
+            param = body_text.split("payParameters=", 1)[1].split("&", 1)[0]
+            parsed = safe_json(unquote_plus(param))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    jbody = safe_json(body_text)
+    if isinstance(jbody, dict):
+        inner = jbody.get("payParameters")
+        if isinstance(inner, dict):
+            return inner
+        if isinstance(inner, str):
+            parsed = safe_json(inner) or safe_json(unquote_plus(inner))
+            if isinstance(parsed, dict):
+                return parsed
+        return jbody
+    return None
+
+
+def _extract_amount_from_pay_data(pay_data: dict) -> float:
+    if not isinstance(pay_data, dict):
+        return 0.0
+    for key in ("moneyAmount", "amount", "sum"):
+        val = pay_data.get(key)
+        if isinstance(val, dict):
+            val = val.get("value")
+        if val is None or val == "":
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
 
 
 def _handle_payment_commission_request(flow: http.HTTPFlow) -> None:
@@ -634,15 +731,13 @@ def _handle_payment_commission_request(flow: http.HTTPFlow) -> None:
     global _fake_payment_done
     try:
         body = flow.request.get_text() or ""
-        if "payParameters=" not in body:
+        pay_data = _parse_pay_parameters_from_body(body)
+        if not isinstance(pay_data, dict):
             return
-        params = urllib.parse.parse_qs(body)
-        pay_str = (params.get("payParameters") or [""])[0]
-        pay_data = json.loads(urllib.parse.unquote(pay_str))
-        amount = float(pay_data.get("moneyAmount", 0) or 0)
+        amount = _extract_amount_from_pay_data(pay_data)
         if amount < 10 or amount > 1_000_000:
             amount = max(10, min(1_000_000, amount))
-        provider = pay_data.get("providerFields") or {}
+        provider = pay_data.get("providerFields") if isinstance(pay_data.get("providerFields"), dict) else {}
         merchant_name = provider.get("merchantName") or provider.get("shortName") or provider.get("name") or provider.get("title")
         merchant_logo = (
             provider.get("merchantLogo")
@@ -661,6 +756,16 @@ def _handle_payment_commission_request(flow: http.HTTPFlow) -> None:
             raw_bank = provider.get("bank") or transfer_data.get("bank_receiver") or "Т-Банк"
             transfer_data["bank_receiver"] = raw_bank
             transfer_data["bank_logo"] = provider.get("bankLogo") or provider.get("logo") or get_bank_logo(raw_bank)
+        comment = str(
+            provider.get("message")
+            or pay_data.get("message")
+            or provider.get("comment")
+            or pay_data.get("comment")
+            or ""
+        ).strip()
+        provider_id = str(pay_data.get("provider") or pay_data.get("providerId") or "p2p-anybank").strip() or "p2p-anybank"
+        transfer_data["comment"] = comment
+        transfer_data["provider_id"] = provider_id
         transfer_data["amount"] = amount
         transfer_data["receiver_phone"] = format_phone(provider.get("pointer"))
         transfer_data["receiver_name"] = (provider.get("maskedFIO") or "Получатель").replace("+", " ").strip()
@@ -671,7 +776,7 @@ def _handle_payment_commission_request(flow: http.HTTPFlow) -> None:
             "resultCode": "OK",
             "trackingId": "COMMISSION_OK",
             "payload": {
-                "providerId": "p2p-anybank",
+                "providerId": provider_id or "p2p-anybank",
                 "description": "Комиссия не взимается банком",
                 "shortDescription": "Комиссия не взимается банком",
                 "limit": 1000000.0,
@@ -730,7 +835,7 @@ def _add_to_fake_history() -> bool:
     if operation_id == _last_fake_op_id:
         print("[transfer] fake_history skip: duplicate op id")
         return False
-    current_hash = f"{transfer_data.get('amount')}_{transfer_data.get('receiver_phone')}_{transfer_data.get('receiver_name')}"
+    current_hash = f"{transfer_data.get('amount')}_{transfer_data.get('receiver_phone')}_{transfer_data.get('receiver_name')}_{transfer_data.get('comment', '')}"
     if current_hash == _last_fake_hash:
         print("[transfer] fake_history skip: duplicate hash")
         return False
@@ -780,6 +885,7 @@ def _add_to_fake_history() -> bool:
             "requisite_phone": str(transfer_data.get("receiver_phone") or "").strip(),
             "sender_name": str(transfer_data.get("sender_name") or "").strip(),
             "requisite_sender_name": str(transfer_data.get("sender_name") or "").strip(),
+            "comment": str(transfer_data.get("comment") or "").strip(),
         }
         try:
             pdf_path = generate_receipt_for_manual_op(op_for_receipt)
@@ -840,16 +946,11 @@ def extract_bank(flow):
 
     # 2. Request body (payParameters)
     body = flow.request.get_text() or ""
-    if "payParameters=" in body:
-        try:
-            param = body.split("payParameters=")[1].split("&")[0]
-            data = safe_json(unquote(param))
-            if data:
-                provider = data.get("providerFields", data) or data
-                bank_id = provider.get("bankMemberId") or provider.get("memberId") or provider.get("bankId")
-                bank_name = provider.get("bank") or provider.get("bankName")
-        except:
-            pass
+    data = _parse_pay_parameters_from_body(body)
+    if isinstance(data, dict):
+        provider = data.get("providerFields") if isinstance(data.get("providerFields"), dict) else data
+        bank_id = bank_id or provider.get("bankMemberId") or provider.get("memberId") or provider.get("bankId")
+        bank_name = bank_name or provider.get("bank") or provider.get("bankName")
 
     # 3. Query parameters
     for key, value in flow.request.query.items():
@@ -974,6 +1075,9 @@ def generate_receipt_for_manual_op(op_data):
         "requisite_sender_name": (
             op_data.get("requisite_sender_name") or op_data.get("sender_name") or ""
         ).strip(),
+        "comment": str(
+            op_data.get("comment") or op_data.get("message") or op_data.get("nomination") or ""
+        ).strip(),
     }
     return func.generate_operation_receipt(mapped)
 
@@ -989,13 +1093,17 @@ def create_real_receipt(operation_id=None):
     tid = operation_id or transfer_data.get("transaction_id") or generate_id(8)
     id_short = str(tid).replace("UNIFIED_", "")[:16]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_pdf = f"receipt_{id_short}_{timestamp}.pdf"
-    final_pdf = f"final_{output_pdf}"
+    output_pdf = os.path.join(_SCRIPT_DIR, f"receipt_{id_short}_{timestamp}.pdf")
+    final_pdf = os.path.join(_SCRIPT_DIR, f"final_receipt_{id_short}_{timestamp}.pdf")
 
-    doc = fitz.open("sbpfinaltbanksend.pdf")
+    tpl_pdf = "sbpfinaltbanksend.pdf" if os.path.isfile("sbpfinaltbanksend.pdf") else os.path.join(_SCRIPT_DIR, "sbpfinaltbanksend.pdf")
+    font_reg = "TinkoffSans-Regular.ttf" if os.path.isfile("TinkoffSans-Regular.ttf") else os.path.join(_SCRIPT_DIR, "TinkoffSans-Regular.ttf")
+    font_med = "TinkoffSans-Medium.ttf" if os.path.isfile("TinkoffSans-Medium.ttf") else os.path.join(_SCRIPT_DIR, "TinkoffSans-Medium.ttf")
+
+    doc = fitz.open(tpl_pdf)
     page = doc[0]
-    page.insert_font("my_normal", "TinkoffSans-Regular.ttf")
-    page.insert_font("my_bold", "TinkoffSans-Medium.ttf")
+    page.insert_font("my_normal", font_reg)
+    page.insert_font("my_bold", font_med)
 
     POSITIONS = {
         "date": (20, 86.5),
@@ -1024,6 +1132,38 @@ def create_real_receipt(operation_id=None):
     page.insert_text(POSITIONS["identificator"], bukva + f"{random.randint(111111111111, 999999999999)}" + "406000004001" + f"{random.randint(11,99)}", fontname="my_normal", fontsize=9.008945, color=(51/255, 51/255, 51/255))
     page.insert_text(POSITIONS["identificator2"], f"{random.randint(11111, 99999)}", fontname="my_normal", fontsize=9.008945, color=(51/255, 51/255, 51/255))
     page.insert_text(POSITIONS["kvit"], transfer_data["kvit_number"], fontname="my_normal", fontsize=9.008945, color=(51/255, 51/255, 51/255))
+
+    comment = str(transfer_data.get("comment") or "").strip()
+    if comment:
+        page.insert_text(
+            (20, 344 + 8.18),
+            "Сообщение получателю",
+            fontname="my_normal",
+            fontsize=9,
+            color=(51 / 255, 51 / 255, 51 / 255),
+        )
+        comment_rect = fitz.Rect(110, 344, 250.02, 415)
+        rc = page.insert_textbox(
+            comment_rect,
+            comment,
+            fontname="my_normal",
+            fontsize=9,
+            color=(51 / 255, 51 / 255, 51 / 255),
+            align=fitz.TEXT_ALIGN_RIGHT,
+        )
+        if rc < 0:
+            trimmed = comment
+            while len(trimmed) > 3:
+                trimmed = trimmed[:-4].rstrip() + "..."
+                if page.insert_textbox(
+                    comment_rect,
+                    trimmed,
+                    fontname="my_normal",
+                    fontsize=9,
+                    color=(51 / 255, 51 / 255, 51 / 255),
+                    align=fitz.TEXT_ALIGN_RIGHT,
+                ) >= 0:
+                    break
 
     doc.save(output_pdf, clean=True, deflate=True, garbage=4)
     doc.close()
@@ -1146,6 +1286,7 @@ def _try_serve_receipt_pdf_response(flow: http.HTTPFlow, url_raw: str) -> bool:
                     "requisite_phone": str(matching_op.get("receiver_phone") or "").strip(),
                     "phone": str(matching_op.get("receiver_phone") or "").strip(),
                     "sender_name": str(transfer_data.get("sender_name") or "").strip(),
+                    "comment": history_mod.extract_transfer_comment(matching_op),
                 }
                 try:
                     pdf_path = generate_receipt_for_manual_op(operation_data)
@@ -1258,6 +1399,11 @@ def response(flow: http.HTTPFlow) -> None:
 
     if _is_mock_pay_request(url, flow.request.method):
         try:
+            if flow.metadata.get("mock_pay_handled"):
+                return
+        except Exception:
+            pass
+        try:
             from history import millis_to_bank_date_str as _msk_date
             transfer_data["date_full"] = _msk_date(int(time.time() * 1000))
         except Exception:
@@ -1294,12 +1440,17 @@ def response(flow: http.HTTPFlow) -> None:
             "paymentId": op_id,
             "payload": payload,
         }
+        flow.response.status_code = 200
         flow.response.text = json.dumps(fake, ensure_ascii=False)
+        flow.response.headers["Content-Type"] = "application/json; charset=utf-8"
+        flow.response.headers["Cache-Control"] = "no-store"
         print("Экран успеха — Квитанция доступна")
         return
 
 def request(flow: http.HTTPFlow) -> None:
     global _fake_payment_done
+    if not is_bank_flow(flow):
+        return
     url = flow.request.pretty_url.lower()
     if any(x in url for x in ["/pay", "get_requisites", "payment_commission", "providers"]):
         log_bank_fio(flow)
@@ -1309,6 +1460,9 @@ def request(flow: http.HTTPFlow) -> None:
         if flow.response is not None:
             return
 
+    if url_prohibit_proxy_json_mutation(url):
+        return
+
     if not _is_mock_pay_request(url, flow.request.method):
         return
 
@@ -1316,28 +1470,35 @@ def request(flow: http.HTTPFlow) -> None:
     amount = 0.0
     phone = None
     name = None
+    comment = ""
+    provider_id = str(transfer_data.get("provider_id") or "p2p-anybank").strip() or "p2p-anybank"
 
-    if "payParameters=" in body_text:
-        try:
-            param = body_text.split("payParameters=")[1].split("&")[0]
-            data = safe_json(unquote(param))
-            if data:
-                amount = float(data.get("moneyAmount") or data.get("amount") or 0)
-                phone = data.get("providerFields", {}).get("pointer")
-                name = data.get("providerFields", {}).get("maskedFIO")
-        except Exception:
-            pass
-    else:
-        jbody = safe_json(body_text)
-        if isinstance(jbody, dict):
-            inner = jbody.get("payParameters") if isinstance(jbody.get("payParameters"), dict) else jbody
-            try:
-                amount = float(inner.get("moneyAmount") or inner.get("amount") or (inner.get("sum") or {}).get("value") if isinstance(inner.get("sum"), dict) else (inner.get("moneyAmount") or inner.get("amount") or 0))
-            except Exception:
-                amount = 0.0
-            pf = inner.get("providerFields") if isinstance(inner.get("providerFields"), dict) else inner
-            phone = pf.get("pointer") or pf.get("phone") or pf.get("recipientPhone")
-            name = pf.get("maskedFIO") or pf.get("receiverName") or pf.get("name")
+    inner = _parse_pay_parameters_from_body(body_text)
+    if isinstance(inner, dict):
+        amount = _extract_amount_from_pay_data(inner)
+        pf = inner.get("providerFields") if isinstance(inner.get("providerFields"), dict) else inner
+        phone = pf.get("pointer") or pf.get("phone") or pf.get("recipientPhone")
+        name = pf.get("maskedFIO") or pf.get("receiverName") or pf.get("name")
+        comment = str(
+            pf.get("message")
+            or inner.get("message")
+            or pf.get("comment")
+            or inner.get("comment")
+            or ""
+        ).strip()
+        if inner.get("provider") or inner.get("providerId"):
+            provider_id = str(inner.get("provider") or inner.get("providerId") or "p2p-anybank").strip() or "p2p-anybank"
+
+    # 2-step confirm fallback if /pay doesn't repeat moneyAmount after payment_commission
+    if amount <= 0 and not _fake_payment_done and float(transfer_data.get("amount") or 0) > 0:
+        if any(m in url for m in ("/api/common/v1/pay", "/payment/execute", "/transfer/confirm")):
+            amount = float(transfer_data.get("amount") or 0)
+            if not phone:
+                phone = transfer_data.get("receiver_phone")
+            if not name:
+                name = transfer_data.get("receiver_name")
+            if not comment:
+                comment = str(transfer_data.get("comment") or "").strip()
 
     if amount > 0:
         _fake_payment_done = False
@@ -1363,6 +1524,8 @@ def request(flow: http.HTTPFlow) -> None:
             "sbp_operation_id": generate_sbp_operation_id(),
             "date_full": _df,
             "timestamp_ms": now_ms,
+            "comment": comment,
+            "provider_id": provider_id,
         })
         save_data(transfer_data)
         print(f"Захвачено: {amount} руб, банк: {transfer_data['bank_receiver']}")
@@ -1389,5 +1552,31 @@ def request(flow: http.HTTPFlow) -> None:
             history_mod.sync_panel_income_expense_with_operations()
         except Exception as ex:
             print(f"[transfer] не удалось обновить balance/transfers в config: {ex}")
+
+        op_id = str(transfer_data.get("transaction_id") or "").strip()
+        payload = {
+            "status": "SUCCESS",
+            "operationId": op_id,
+            "paymentId": op_id,
+            "id": op_id,
+        }
+        fake = {
+            "resultCode": "OK",
+            "trackingId": op_id,
+            "operationId": op_id,
+            "paymentId": op_id,
+            "payload": payload,
+        }
+        flow.response = http.Response.make(
+            200,
+            json.dumps(fake, ensure_ascii=False).encode("utf-8"),
+            {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"},
+        )
+        try:
+            flow.metadata["mock_pay_handled"] = True
+        except Exception:
+            pass
+        print(f"Экран успеха — Квитанция доступна ({op_id})")
+        return
 
 print("[TRANSFER v37] fake_history + commission + operations inject; банк по bankMemberId")

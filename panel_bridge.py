@@ -1,15 +1,21 @@
 from mitmproxy import http
+import asyncio
+import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 import sys
 import os
 import random
 from pathlib import Path
+import threading
+import time
 from typing import Optional
 import hashlib
 import urllib.request
 
 sys.path.append(os.path.dirname(__file__))
+import bank_filter
 import controller
 import history
 from bank_filter import (
@@ -22,6 +28,8 @@ from bank_filter import (
     bank_https_panel_request,
     request_is_panel_mitm_port,
 )
+
+_is_telemetry_or_log_url = getattr(bank_filter, "is_telemetry_or_log_url", None)
 
 ALLOWED_IPS = ["188.127.237.61", "31.177.109.149", "193.233.89.185", "85.209.135.247", "5.18.160.29", "85.192.60.79", "127.0.0.1"]
 PANEL_PORT = 8082
@@ -103,109 +111,368 @@ _PANEL_STATIC_DIR = os.path.join(_BASE_DIR, "panel_static")
 _PANEL_FA_CDN = "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3"
 _PANEL_FA_CACHE = os.path.join(_PANEL_STATIC_DIR, "fa-cache")
 
+# Прямой HTTP-клиент БЕЗ системного прокси (чтобы 127.0.0.1:8082 не зацикливал сам себя).
+_DIRECT_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_ASSET_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="panel_asset")
+_ASSET_CACHE_LOCK = threading.Lock()
+_LOGO_RAM_CACHE: dict[str, tuple[bytes, str]] = {}
+_LOGO_NEG_CACHE: dict[str, float] = {}
+_FA_RAM_CACHE: dict[str, tuple[bytes, str]] = {}
+_FA_NEG_CACHE: dict[str, float] = {}
+_NEG_CACHE_TTL_SEC = 60.0
 
-def _panel_http_get(url: str, timeout: float = 8.0) -> bytes:
+_TRANSPARENT_1X1_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+)
+
+_ALLOWED_LOGO_HOSTS = frozenset({
+    "imgproxy.cdn-tinkoff.ru",
+    "brands-prod.cdn-tinkoff.ru",
+    "brands-static.cdn-tinkoff.ru",
+    "bms-logo-prod.t-static.ru",
+    "cdn.tbank.ru",
+    "acdn.tinkoff.ru",
+    "static.tbank.ru",
+    "static.tinkoff.ru",
+    "sso-forms-prod.t-static.ru",
+})
+
+_BANK_PRESET_LOGO_URLS = (
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vdHJhbnNmZXJzLWMxLnBuZw==",
+    "https://brands-prod.cdn-tinkoff.ru/general_logo/sber.png",
+    "https://brands-prod.cdn-tinkoff.ru/general_logo/tinkoff-new.png",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vYWxmYWJhbmsucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vdnRiYmFuay5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vcHJvbXN2eWF6YmFuay5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28veWEtYmFuay5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vd2lsZGJlcnJpZXMtYmFuay5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vc292Y29tYmFuay5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vYWtiLnBuZw==",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vbXRzZGVuZ2kucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vYW1vYmF5bC5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vZXNraGF0YS1uZXcucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vdXJhbHNpYi5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vZm9yYWJhbmsucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vZ2VuYmFuay1uZXcucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vYWtiX3Jvc3NpeWEucG5n",
+    "https://bms-logo-prod.t-static.ru/general_logo/1cupis-mplat.png",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vcm5jYi5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vYWtjZXB0LnBuZw==",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vZG9tcmZiYW5rLnBuZw==",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vdWJyaXIucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28va3JlZGl0LWV2cm9wYS1iYW5rLnBuZw==",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vcG9jaHRhLWJhbmsucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vY2lmcmEtYmFuay5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vc3BpdGFtZW5iYW5rLnBuZw==",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vbWtiLW5ldy0yLnBuZw==",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vcm9zc2VsaG96YmFuay5wbmc=",
+    "https://bms-logo-prod.t-static.ru/general_logo/primbank-new.png",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vcHJpbS1zb2MtYmFuay5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vYmFua3NwYi5wbmc=",
+    "https://bms-logo-prod.t-static.ru/general_logo/rocketbank.png",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vcmFpZmZlaXNlbi5wbmc=",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vbWJicnUucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vY2VudHJpbnZlc3QucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vb2N0by1iYW5rLnBuZw==",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28veW9vbW9uZXkucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vZ2F6cHJvbWJhbmsucG5n",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vbXRzLWJhbmsucG5n",
+    "https://brands-prod.cdn-tinkoff.ru/general_logo/finance-ozon-2.png",
+    "https://imgproxy.cdn-tinkoff.ru/compressed95/aHR0cHM6Ly9icmFuZHMtcHJvZC5jZG4tdGlua29mZi5ydS9nZW5lcmFsX2xvZ28vb3RwYmFuay1uZXcucG5n",
+)
+
+
+def _panel_http_get(url: str, timeout: float = 2.5) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "tbankmitm-panel/1"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _DIRECT_HTTP_OPENER.open(req, timeout=timeout) as resp:
         return resp.read()
 
 
-def _panel_asset_headers(content_type: str) -> dict:
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        Path(tmp).write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _panel_asset_headers(content_type: str, max_age: int = 604800) -> dict:
     return {
         "Content-Type": content_type,
-        "Cache-Control": "public, max-age=604800",
+        "Cache-Control": f"public, max-age={int(max_age)}",
         "Access-Control-Allow-Origin": "*",
     }
 
 
-def _try_serve_panel_fa(flow: http.HTTPFlow, path_only: str) -> bool:
-    """Font Awesome с того же origin (:8082) — иконки работают даже при Potatso и без panel_static/."""
+def _fa_cache_path_and_ct(rel: str) -> tuple[Optional[str], Optional[str]]:
+    if rel == "all.min.css":
+        return os.path.join(_PANEL_FA_CACHE, "all.min.css"), "text/css; charset=utf-8"
+    if rel.startswith("webfonts/"):
+        fname = rel.split("/", 1)[1]
+        if not fname or ".." in fname or "/" in fname:
+            return None, None
+        ct = "font/woff2" if fname.endswith(".woff2") else ("font/ttf" if fname.endswith(".ttf") else "font/woff")
+        return os.path.join(_PANEL_FA_CACHE, "webfonts", fname), ct
+    return None, None
+
+
+def _lookup_fa_cached(rel: str) -> Optional[tuple[bytes, str, bool]]:
+    cache_fp, ct = _fa_cache_path_and_ct(rel)
+    if not cache_fp or not ct:
+        return None
+    with _ASSET_CACHE_LOCK:
+        hit = _FA_RAM_CACHE.get(rel)
+        if hit is not None:
+            return hit[0], hit[1], False
+        neg_until = _FA_NEG_CACHE.get(rel, 0.0)
+        if neg_until > time.monotonic():
+            return b"", ct, True
+    if os.path.isfile(cache_fp) and os.path.getsize(cache_fp) > (500 if rel == "all.min.css" else 0):
+        try:
+            data = Path(cache_fp).read_bytes()
+            with _ASSET_CACHE_LOCK:
+                _FA_RAM_CACHE[rel] = (data, ct)
+            return data, ct, False
+        except OSError:
+            pass
+    return None
+
+
+def _fetch_and_cache_fa(rel: str) -> tuple[bytes, str, bool]:
+    cached = _lookup_fa_cached(rel)
+    if cached is not None:
+        return cached
+    cache_fp, ct = _fa_cache_path_and_ct(rel)
+    if not cache_fp or not ct:
+        return b"", "application/octet-stream", True
+    try:
+        if rel == "all.min.css":
+            raw = _panel_http_get(f"{_PANEL_FA_CDN}/css/all.min.css", timeout=2.5).decode("utf-8", errors="replace")
+            raw = raw.replace("../webfonts/", "/panel-fa/webfonts/")
+            data = raw.encode("utf-8")
+        else:
+            fname = rel.split("/", 1)[1]
+            data = _panel_http_get(f"{_PANEL_FA_CDN}/webfonts/{fname}", timeout=2.5)
+        if not data:
+            raise ValueError("empty response")
+        _atomic_write_bytes(cache_fp, data)
+        with _ASSET_CACHE_LOCK:
+            _FA_RAM_CACHE[rel] = (data, ct)
+            _FA_NEG_CACHE.pop(rel, None)
+        return data, ct, False
+    except Exception as ex:
+        print(f"[panel_bridge] panel-fa {rel!r}: {ex}")
+        with _ASSET_CACHE_LOCK:
+            _FA_NEG_CACHE[rel] = time.monotonic() + _NEG_CACHE_TTL_SEC
+        return b"", ct, True
+
+
+def _apply_fa_response(flow: http.HTTPFlow, rel: str, res: tuple[bytes, str, bool]) -> None:
+    data, ct, is_err = res
+    if is_err or not data:
+        flow.response = http.Response.make(502, b"Font Awesome upstream error")
+    else:
+        flow.response = http.Response.make(200, data, _panel_asset_headers(ct))
+
+
+async def _try_serve_panel_fa_async(flow: http.HTTPFlow, path_only: str) -> bool:
+    """Font Awesome с того же origin (:8082) — неблокирующий кэш RAM/диск + пул потоков."""
     if not path_only.startswith("/panel-fa/"):
         return False
     rel = path_only[len("/panel-fa/") :].lstrip("/").replace("\\", "/")
     if not rel or ".." in rel.split("/"):
         flow.response = http.Response.make(403, b"Forbidden")
         return True
-    try:
-        if rel == "all.min.css":
-            cache_css = os.path.join(_PANEL_FA_CACHE, "all.min.css")
-            if os.path.isfile(cache_css) and os.path.getsize(cache_css) > 500:
-                data = Path(cache_css).read_bytes()
-            else:
-                raw = _panel_http_get(f"{_PANEL_FA_CDN}/css/all.min.css").decode("utf-8", errors="replace")
-                raw = raw.replace("../webfonts/", "/panel-fa/webfonts/")
-                os.makedirs(_PANEL_FA_CACHE, exist_ok=True)
-                Path(cache_css).write_text(raw, encoding="utf-8")
-                data = raw.encode("utf-8")
-            flow.response = http.Response.make(200, data, _panel_asset_headers("text/css; charset=utf-8"))
-            return True
-        if rel.startswith("webfonts/"):
-            fname = rel.split("/", 1)[1]
-            if not fname or ".." in fname or "/" in fname:
-                flow.response = http.Response.make(403, b"Forbidden")
-                return True
-            cache_font = os.path.join(_PANEL_FA_CACHE, "webfonts", fname)
-            if not os.path.isfile(cache_font):
-                os.makedirs(os.path.dirname(cache_font), exist_ok=True)
-                Path(cache_font).write_bytes(_panel_http_get(f"{_PANEL_FA_CDN}/webfonts/{fname}"))
-            data = Path(cache_font).read_bytes()
-            ct = "font/woff2" if fname.endswith(".woff2") else "font/woff"
-            flow.response = http.Response.make(200, data, _panel_asset_headers(ct))
-            return True
-    except Exception as ex:
-        print(f"[panel_bridge] panel-fa {rel!r}: {ex}")
-        flow.response = http.Response.make(502, b"Font Awesome upstream error")
+    cache_fp, ct = _fa_cache_path_and_ct(rel)
+    if rel.startswith("webfonts/") and (not cache_fp or not ct):
+        flow.response = http.Response.make(403, b"Forbidden")
         return True
-    flow.response = http.Response.make(404, b"Not found")
+    if not cache_fp or not ct:
+        flow.response = http.Response.make(404, b"Not found")
+        return True
+    cached = _lookup_fa_cached(rel)
+    if cached is not None:
+        _apply_fa_response(flow, rel, cached)
+        return True
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(_ASSET_EXECUTOR, _fetch_and_cache_fa, rel)
+    _apply_fa_response(flow, rel, res)
     return True
 
 
-def _try_serve_panel_bank_logo(flow: http.HTTPFlow, path_only: str) -> bool:
-    """Логотипы пресетов через :8082 — img не блокируется фильтром CONNECT на телефоне."""
+def _try_serve_panel_fa(flow: http.HTTPFlow, path_only: str) -> bool:
+    """Синхронная обёртка для тестов/прямых вызовов."""
+    if not path_only.startswith("/panel-fa/"):
+        return False
+    rel = path_only[len("/panel-fa/") :].lstrip("/").replace("\\", "/")
+    if not rel or ".." in rel.split("/"):
+        flow.response = http.Response.make(403, b"Forbidden")
+        return True
+    cache_fp, ct = _fa_cache_path_and_ct(rel)
+    if rel.startswith("webfonts/") and (not cache_fp or not ct):
+        flow.response = http.Response.make(403, b"Forbidden")
+        return True
+    if not cache_fp or not ct:
+        flow.response = http.Response.make(404, b"Not found")
+        return True
+    _apply_fa_response(flow, rel, _fetch_and_cache_fa(rel))
+    return True
+
+
+def _logo_meta_for_url(raw_url: str) -> tuple[str, str]:
+    low = raw_url.lower()
+    ext = ".png"
+    ct = "image/png"
+    if ".jpg" in low or ".jpeg" in low:
+        ext = ".jpg"
+        ct = "image/jpeg"
+    elif ".webp" in low:
+        ext = ".webp"
+        ct = "image/webp"
+    elif ".svg" in low:
+        ext = ".svg"
+        ct = "image/svg+xml"
+    cache_dir = os.path.join(_PANEL_STATIC_DIR, "logo-cache")
+    cache_key = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()[:32]
+    return os.path.join(cache_dir, cache_key + ext), ct
+
+
+def _validate_logo_url(raw_url: str) -> tuple[bool, int, bytes]:
+    if not raw_url.startswith("https://"):
+        return False, 400, b"bad url"
+    try:
+        parsed = urlparse(raw_url)
+        host = (parsed.hostname or "").lower().strip(".")
+    except Exception:
+        host = ""
+    if not host or host not in _ALLOWED_LOGO_HOSTS:
+        return False, 403, b"host not allowed"
+    return True, 200, b""
+
+
+def _lookup_bank_logo_cached(raw_url: str, cache_fp: str, ct: str) -> Optional[tuple[bytes, str, bool]]:
+    with _ASSET_CACHE_LOCK:
+        hit = _LOGO_RAM_CACHE.get(raw_url)
+        if hit is not None:
+            return hit[0], hit[1], False
+        neg_until = _LOGO_NEG_CACHE.get(raw_url, 0.0)
+        if neg_until > time.monotonic():
+            return _TRANSPARENT_1X1_PNG, "image/png", True
+    if os.path.isfile(cache_fp) and os.path.getsize(cache_fp) > 0:
+        try:
+            data = Path(cache_fp).read_bytes()
+            if data:
+                with _ASSET_CACHE_LOCK:
+                    _LOGO_RAM_CACHE[raw_url] = (data, ct)
+                return data, ct, False
+        except OSError:
+            pass
+    return None
+
+
+def _fetch_and_cache_bank_logo(raw_url: str, cache_fp: str, ct: str) -> tuple[bytes, str, bool]:
+    cached = _lookup_bank_logo_cached(raw_url, cache_fp, ct)
+    if cached is not None:
+        return cached
+    try:
+        data = _panel_http_get(raw_url, timeout=2.5)
+        head = (data or b"")[:32].lstrip().lower()
+        if not data or head.startswith((b"<!doctype", b"<html")):
+            raise ValueError("empty or html response")
+        _atomic_write_bytes(cache_fp, data)
+        with _ASSET_CACHE_LOCK:
+            _LOGO_RAM_CACHE[raw_url] = (data, ct)
+            _LOGO_NEG_CACHE.pop(raw_url, None)
+        return data, ct, False
+    except Exception as ex:
+        print(f"[panel_bridge] panel-bank-logo: {ex}")
+        with _ASSET_CACHE_LOCK:
+            _LOGO_NEG_CACHE[raw_url] = time.monotonic() + _NEG_CACHE_TTL_SEC
+        return _TRANSPARENT_1X1_PNG, "image/png", True
+
+
+def _apply_bank_logo_response(flow: http.HTTPFlow, res: tuple[bytes, str, bool]) -> None:
+    data, ct, is_fallback = res
+    max_age = 60 if is_fallback else 604800
+    flow.response = http.Response.make(200, data, _panel_asset_headers(ct, max_age=max_age))
+
+
+async def _try_serve_panel_bank_logo_async(flow: http.HTTPFlow, path_only: str) -> bool:
+    """Логотипы банков без блокировки event loop mitmproxy (RAM/диск + пул потоков + 1x1 fallback)."""
     if not path_only.startswith("/panel-bank-logo"):
         return False
     qs = _panel_request_query_params(flow.request.path or path_only)
     raw_url = (qs.get("u") or qs.get("url") or [""])[0]
     raw_url = (raw_url or "").strip()
-    if not raw_url.startswith("https://"):
-        flow.response = http.Response.make(400, b"bad url")
+    ok, err_code, err_body = _validate_logo_url(raw_url)
+    if not ok:
+        flow.response = http.Response.make(err_code, err_body)
         return True
-    low = raw_url.lower()
-    allowed = (
-        "imgproxy.cdn-tinkoff.ru/",
-        "brands-prod.cdn-tinkoff.ru/",
-        "brands-static.cdn-tinkoff.ru/",
-        "bms-logo-prod.t-static.ru/",
-    )
-    if not any(m in low for m in allowed):
-        flow.response = http.Response.make(403, b"host not allowed")
+    cache_fp, ct = _logo_meta_for_url(raw_url)
+    cached = _lookup_bank_logo_cached(raw_url, cache_fp, ct)
+    if cached is not None:
+        _apply_bank_logo_response(flow, cached)
         return True
-    cache_dir = os.path.join(_PANEL_STATIC_DIR, "logo-cache")
-    cache_key = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()[:32]
-    ext = ".png"
-    if ".jpg" in low or ".jpeg" in low:
-        ext = ".jpg"
-    elif ".webp" in low:
-        ext = ".webp"
-    cache_fp = os.path.join(cache_dir, cache_key + ext)
-    try:
-        if os.path.isfile(cache_fp) and os.path.getsize(cache_fp) > 0:
-            data = Path(cache_fp).read_bytes()
-        else:
-            data = _panel_http_get(raw_url)
-            os.makedirs(cache_dir, exist_ok=True)
-            Path(cache_fp).write_bytes(data)
-    except Exception as ex:
-        print(f"[panel_bridge] panel-bank-logo: {ex}")
-        flow.response = http.Response.make(502, b"upstream error")
-        return True
-    ct = "image/png"
-    if ".jpg" in low or ".jpeg" in low:
-        ct = "image/jpeg"
-    elif ".webp" in low:
-        ct = "image/webp"
-    flow.response = http.Response.make(200, data, _panel_asset_headers(ct))
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(_ASSET_EXECUTOR, _fetch_and_cache_bank_logo, raw_url, cache_fp, ct)
+    _apply_bank_logo_response(flow, res)
     return True
+
+
+def _try_serve_panel_bank_logo(flow: http.HTTPFlow, path_only: str) -> bool:
+    """Синхронная обёртка для тестов/прямых вызовов."""
+    if not path_only.startswith("/panel-bank-logo"):
+        return False
+    qs = _panel_request_query_params(flow.request.path or path_only)
+    raw_url = (qs.get("u") or qs.get("url") or [""])[0]
+    raw_url = (raw_url or "").strip()
+    ok, err_code, err_body = _validate_logo_url(raw_url)
+    if not ok:
+        flow.response = http.Response.make(err_code, err_body)
+        return True
+    cache_fp, ct = _logo_meta_for_url(raw_url)
+    _apply_bank_logo_response(flow, _fetch_and_cache_bank_logo(raw_url, cache_fp, ct))
+    return True
+
+
+def _prewarm_panel_assets() -> None:
+    """Фоновый прогрев логотипов банков-пресетов и Font Awesome при старте."""
+    urls: list[str] = list(_BANK_PRESET_LOGO_URLS)
+    try:
+        presets = history.load_merchant_presets() or {}
+        for block in presets.values():
+            if not isinstance(block, dict):
+                continue
+            m = block.get("merchant") or {}
+            if isinstance(m, dict):
+                raw_lg = str(m.get("logo") or m.get("logoUrl") or m.get("image") or "").strip()
+                if raw_lg.startswith("https://"):
+                    norm = history._normalize_logo_url(raw_lg)
+                    if norm and norm not in urls:
+                        urls.append(norm)
+    except Exception:
+        pass
+    try:
+        _ASSET_EXECUTOR.submit(_fetch_and_cache_fa, "all.min.css")
+    except Exception:
+        pass
+    for u in urls:
+        ok, _, _ = _validate_logo_url(u)
+        if not ok:
+            continue
+        cache_fp, ct = _logo_meta_for_url(u)
+        if _lookup_bank_logo_cached(u, cache_fp, ct) is not None:
+            continue
+        try:
+            _ASSET_EXECUTOR.submit(_fetch_and_cache_bank_logo, u, cache_fp, ct)
+        except Exception:
+            break
 
 
 def _try_serve_panel_static(flow: http.HTTPFlow, path_only: str) -> bool:
@@ -592,6 +859,7 @@ HTML_PANEL = """<!DOCTYPE html>
         .op-meta-line { font-size: 0.8rem; color: #a0aec0; margin-top: 2px; }
         .op-meta-line.bank { color: #718096; }
         .op-meta-line.requisite { color: #c7a83a; }
+        .op-meta-line.comment { color: #90cdf4; }
         .op-amount {
             font-weight: 700;
             font-size: 1.1rem;
@@ -1334,11 +1602,11 @@ HTML_PANEL = """<!DOCTYPE html>
         }
 
         function openEditManualModal(op) {
-            if (!op || !op.manual || !op.id) return;
+            if (!op || (!op.manual && !op.fake_transfer) || !op.id) return;
             document.getElementById('edit_manual_id').value = op.id;
             document.getElementById('edit_direction').value = op.type === 'Credit' ? 'in' : 'out';
             document.getElementById('edit_amount').value = Math.abs(op.amount || 0);
-            const preset = (op.bank_preset || 'custom').toLowerCase();
+            const preset = (op.bank_preset || (op.fake_transfer ? 'sbp' : 'custom')).toLowerCase();
             const sel = document.getElementById('edit_bank_preset');
             if ([...sel.options].some(o => o.value === preset)) sel.value = preset;
             else sel.value = 'custom';
@@ -1346,7 +1614,7 @@ HTML_PANEL = """<!DOCTYPE html>
             document.getElementById('edit_datetime').value = bankDateToDatetimeLocal(op.date);
             const editSec = document.getElementById('edit_seconds');
             if (editSec) editSec.value = String(bankDateToSeconds(op.date));
-            document.getElementById('edit_title').value = op.title || '';
+            document.getElementById('edit_title').value = op.title || op.desc || '';
             document.getElementById('edit_subtitle').value = op.subtitle || '';
             document.getElementById('edit_phone').value = op.requisite_phone || op.phone || '';
             const erp = document.getElementById('edit_receipt_phone');
@@ -1355,7 +1623,10 @@ HTML_PANEL = """<!DOCTYPE html>
             document.getElementById('edit_sender_name').value = op.requisite_sender_name || op.sender_name || '';
             document.getElementById('edit_recipient_type').value = (op.requisite_phone || op.phone) ? 'phone' : 'card';
             updateDirectionSpecificFields('edit');
-            document.getElementById('edit_desc').value = op.description || '';
+            const opComment = (op.comment !== undefined && op.comment !== null)
+                ? String(op.comment)
+                : (op.manual ? String(op.description || '') : '');
+            document.getElementById('edit_desc').value = opComment;
             const modal = document.getElementById('editManualModal');
             modal.classList.add('show');
         }
@@ -1376,6 +1647,7 @@ HTML_PANEL = """<!DOCTYPE html>
             const direction = document.getElementById('edit_direction').value;
             const requisitePhone = (document.getElementById('edit_phone').value || '').trim();
             const requisiteSenderName = (document.getElementById('edit_sender_name').value || '').trim();
+            const commentVal = (document.getElementById('edit_desc').value || '').trim();
             fetch('/api/operations/update', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -1394,7 +1666,7 @@ HTML_PANEL = """<!DOCTYPE html>
                     sender_name: requisiteSenderName,
                     requisite_sender_name: requisiteSenderName,
                     receipt_phone: direction === 'in' ? (document.getElementById('edit_receipt_phone').value || '').trim() : '',
-                    description: document.getElementById('edit_desc').value
+                    comment: commentVal
                 })
             })
             .then(r => r.json())
@@ -1668,7 +1940,7 @@ HTML_PANEL = """<!DOCTYPE html>
             const search = document.getElementById('search').value.toLowerCase();
             const type = document.getElementById('typeFilter').value;
             let filtered = operations.filter(op => {
-                const hay = ((op.desc || '') + ' ' + (op.subtitle || '') + ' ' + (op.bank || '') + ' ' + (op.requisite_phone || op.phone || '') + ' ' + (op.requisite_sender_name || op.sender_name || '') + ' ' + (op.card_number || '')).toLowerCase();
+                const hay = ((op.desc || '') + ' ' + (op.subtitle || '') + ' ' + (op.comment || '') + ' ' + (op.bank || '') + ' ' + (op.requisite_phone || op.phone || '') + ' ' + (op.requisite_sender_name || op.sender_name || '') + ' ' + (op.card_number || '')).toLowerCase();
                 if (search && !hay.includes(search)) return false;
                 if (type === 'income' && op.type !== 'Credit') return false;
                 if (type === 'expense' && op.type !== 'Debit') return false;
@@ -1690,13 +1962,16 @@ HTML_PANEL = """<!DOCTYPE html>
                 const sign = income ? '+' : '-';
                 const metaLines = [];
                 if (op.subtitle) metaLines.push(`<div class="op-meta-line">${escapeHtml(op.subtitle)}</div>`);
+                const opComment = (op.comment !== undefined && op.comment !== null) ? String(op.comment).trim() : '';
+                if (opComment) metaLines.push(`<div class="op-meta-line comment">💬 ${escapeHtml(opComment)}</div>`);
                 if (op.requisite_phone || op.phone) metaLines.push(`<div class="op-meta-line requisite">${escapeHtml(op.requisite_phone || op.phone)}</div>`);
                 if (op.requisite_sender_name || op.sender_name) metaLines.push(`<div class="op-meta-line requisite">${escapeHtml(op.requisite_sender_name || op.sender_name)}</div>`);
                 if (op.card_number) metaLines.push(`<div class="op-meta-line requisite">${escapeHtml(op.card_number)}</div>`);
                 if (op.bank) metaLines.push(`<div class="op-meta-line bank">${escapeHtml(op.bank)}${op.bank_preset && op.bank_preset !== 'custom' ? ' · ' + escapeHtml(op.bank_preset) : ''}</div>`);
                 else if (op.bank_preset && op.bank_preset !== 'custom') metaLines.push(`<div class="op-meta-line bank">${escapeHtml(op.bank_preset)}</div>`);
                 const opJson = JSON.stringify(op).replace(/</g, '\\u003c');
-                const editBtn = op.manual ? `<button class="action-btn" style="margin-right:6px;" onclick='openEditManualModal(${opJson})' title="Изменить"><i class="fas fa-pen"></i></button>` : '';
+                const canEdit = op.manual || op.fake_transfer;
+                const editBtn = canEdit ? `<button class="action-btn" style="margin-right:6px;" onclick='openEditManualModal(${opJson})' title="Изменить"><i class="fas fa-pen"></i></button>` : '';
                 const canDelete = op.manual || op.fake_transfer;
                 const delBtn = canDelete ? `<button class="action-btn" style="margin-right:6px;" onclick="deleteManualOp('${op.id}')" title="Удалить"><i class="fas fa-trash-alt"></i></button>` : '';
                 const opTag = op.manual ? '<span style="color:#9f7aea;">· вручную</span>' : (op.fake_transfer ? '<span style="color:#63b3ed;">· перевод (мок)</span>' : '');
@@ -1843,11 +2118,12 @@ HTML_PANEL = """<!DOCTYPE html>
             );
             const presetKey = document.getElementById('manual_bank_preset').value;
             const presetLogo = (BANK_PRESET_META[presetKey] && BANK_PRESET_META[presetKey].logo) ? BANK_PRESET_META[presetKey].logo : '';
+            const commentVal = (document.getElementById('manual_desc').value || '').trim();
             const body = {
                 direction: direction,
                 amount: amount,
                 bank: document.getElementById('manual_bank').value,
-                description: document.getElementById('manual_desc').value,
+                comment: commentVal,
                 title: document.getElementById('manual_title').value,
                 subtitle: document.getElementById('manual_subtitle').value,
                 bank_preset: presetKey,
@@ -1867,9 +2143,6 @@ HTML_PANEL = """<!DOCTYPE html>
             })
             .then(r => r.json())
             .then(d => {
-                // #region agent log
-                fetch('http://127.0.0.1:7282/ingest/3dd357cb-edb0-4b4c-aa35-b366d0c21a09',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f24997'},body:JSON.stringify({sessionId:'f24997',runId:'verify1',hypothesisId:'H3',location:'panel_bridge.addManualOperation',message:'add response',data:{ok:!d.error,hasId:!!d.id,hasReceipt:!!d.receipt_path},timestamp:Date.now()})}).catch(()=>{});
-                // #endregion
                 if (d.error) throw new Error(d.error);
                 showToast('Добавлена новая операция');
                 document.getElementById('manual_amount').value = '';
@@ -1921,7 +2194,7 @@ HTML_PANEL = """<!DOCTYPE html>
 
         function saveSettings() {
             const originEl = document.getElementById('panel_fetch_origin');
-            const origin = originEl ? (originEl.value || '').trim().replace(/\\/+$/, '') : '';
+            const origin = originEl ? (originEl.value || '').trim().replace(/\/+$/, '') : '';
             saveConfig({
                 history: {
                     show_categories: document.getElementById('show_categories').value === 'true',
@@ -1971,21 +2244,32 @@ HTML_PANEL = """<!DOCTYPE html>
 </body>
 </html>"""
 
-def request(flow: http.HTTPFlow) -> None:
-    # HTTPS PWA (tbank-online.com): /__tbankmitm_panel/api/* — тот же API, без mixed content.
+async def request(flow: http.HTTPFlow) -> None:
+    # HTTPS PWA (tbank-online.com / tbank.ru): /__tbankmitm_panel/api/* — тот же API, без mixed content.
     via_bank_https = bank_https_panel_request(flow)
     if not via_bank_https and not request_is_panel_mitm_port(flow, PANEL_PORT):
         return
 
     path = flow.request.path
     path_only = _panel_request_path_only(path)
+    if path_only.startswith("/__tbankmitm_panel"):
+        inner = path_only[len("/__tbankmitm_panel"):] or "/"
+        if not inner.startswith("/"):
+            inner = "/" + inner
+        query = path[len(path_only):]
+        path_only = inner
+        flow.request.path = inner + query
 
-    if flow.request.method == "GET" and _try_serve_panel_static(flow, path_only):
-        return
-    if flow.request.method == "GET" and _try_serve_panel_fa(flow, path_only):
-        return
-    if flow.request.method == "GET" and _try_serve_panel_bank_logo(flow, path_only):
-        return
+    if flow.request.method == "GET":
+        if path_only == "/panel-static/all.min.css":
+            if await _try_serve_panel_fa_async(flow, "/panel-fa/all.min.css"):
+                return
+        if _try_serve_panel_static(flow, path_only):
+            return
+        if await _try_serve_panel_fa_async(flow, path_only):
+            return
+        if await _try_serve_panel_bank_logo_async(flow, path_only):
+            return
 
     client_ip = flow.client_conn.address[0]
     if not _client_ok_for_panel(client_ip):
@@ -2183,6 +2467,24 @@ def request(flow: http.HTTPFlow) -> None:
             flow.response = http.Response.make(400, b'{"error":"bad request"}')
         return
 
+    if flow.response is None and flow.request.method == "GET" and path_only == "/api/operations":
+        qs = _panel_request_query_params(path)
+        compact = (qs.get("compact") or ["0"])[0].strip().lower() in ("1", "true", "yes")
+        try:
+            resp_data = history.build_operations_api_response(compact=compact)
+        except TypeError:
+            resp_data = history.build_operations_api_response()
+        flow.response = http.Response.make(
+            200,
+            json.dumps(resp_data, ensure_ascii=False).encode("utf-8"),
+            {
+                "Content-Type": "application/json; charset=utf-8",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+            },
+        )
+        return
+
     if path == "/favicon.ico":
         flow.response = http.Response.make(204)
 
@@ -2212,16 +2514,19 @@ def response(flow: http.HTTPFlow) -> None:
         return
     if not flow.response:
         return
+    if callable(_is_telemetry_or_log_url) and _is_telemetry_or_log_url(url):
+        return
+    if url_prohibit_proxy_json_mutation(url):
+        return
+    if flow_statements_spravki_context(flow):
+        return
+    ct_raw = (flow.response.headers.get("content-type") or "").lower()
+    if ct_raw and not ("json" in ct_raw or "graphql" in ct_raw or "text/plain" in ct_raw):
+        return
     ensure_response_decoded(flow)
     if not flow.response.text:
         return
     if not is_jsonish_response(flow):
-        return
-
-    if url_prohibit_proxy_json_mutation(url):
-        return
-
-    if flow_statements_spravki_context(flow):
         return
 
     # Подмена гистограмм/сводок расходов-доходов. На mybank URL у Т-Банка периодически меняются,
@@ -2341,6 +2646,7 @@ def running() -> None:
     print(f"[+] panel_bridge: mitm слушает панель http://{ip}:{PANEL_PORT}/admin")
     print(f"[+] panel_bridge: allow_any={allow} listen_host={listen}")
     print(f"[+] panel_bridge: открывайте панель с Potatso ВЫКЛ или IP VPS в bypass прокси")
+    threading.Thread(target=_prewarm_panel_assets, daemon=True, name="panel_prewarm").start()
 
 
 print(f"[+] panel_bridge загружен, панель доступна по http://{HOST_IP}:{PANEL_PORT}/admin")
